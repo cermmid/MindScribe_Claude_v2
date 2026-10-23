@@ -11,13 +11,14 @@ from .config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
     GEMINI_THINKING_BUDGET,
+    TRANSCRIPTION_MODEL,
     USE_VERTEX_AI,
     _gcp_credentials_info,
     thinking_budget_for,
 )
 from .pricing import estimate_usage_and_cost
-from .prompts import SYSTEM_PROMPT, build_user_prompt
-from .schemas import DokumentacjaDraft
+from .prompts import NO_SPEECH_MARKER, SYSTEM_PROMPT, TRANSCRIPTION_PROMPT, build_user_prompt
+from .schemas import DokumentacjaDraft, DokumentacjaSekcje
 
 
 def _vertex_credentials():
@@ -70,11 +71,11 @@ def _client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def _generation_config() -> types.GenerateContentConfig:
+def _generation_config(schema) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
-        response_schema=DokumentacjaDraft,
+        response_schema=schema,
         temperature=0.2,
         thinking_config=types.ThinkingConfig(
             thinking_budget=thinking_budget_for(GEMINI_MODEL, GEMINI_THINKING_BUDGET)
@@ -82,24 +83,44 @@ def _generation_config() -> types.GenerateContentConfig:
     )
 
 
-def _usage_of(response) -> dict:
-    """Zużycie i koszt, wyceniane po modelu, który FAKTYCZNIE odpowiedział.
-
-    `model_version` bierzemy przed `GEMINI_MODEL`, bo konfiguracja może wskazywać
-    alias (np. `…-latest`), a rachunek wystawia się za wydanie, które policzyło.
-    """
-    return estimate_usage_and_cost(
-        getattr(response, "usage_metadata", None),
-        model=getattr(response, "model_version", None) or GEMINI_MODEL,
+def _transcription_config() -> types.GenerateContentConfig:
+    # Bez myślenia: przepisanie rozmowy nie wymaga rozumowania, a każdy token myślenia
+    # to czas, na który czeka lekarz. Gdyby ktoś ustawił model, który myślenia wyłączyć
+    # nie umie, `thinking_budget_for` podniesie budżet do jego minimum.
+    return types.GenerateContentConfig(
+        system_instruction=TRANSCRIPTION_PROMPT,
+        temperature=0.0,
+        thinking_config=types.ThinkingConfig(
+            thinking_budget=thinking_budget_for(TRANSCRIPTION_MODEL, 0)
+        ),
     )
 
 
-def _parse(response) -> DokumentacjaDraft:
+def _usage_of(response, default_model: str) -> dict:
+    """Zużycie i koszt, wyceniane po modelu, który FAKTYCZNIE odpowiedział.
+
+    `model_version` bierzemy przed nazwą z konfiguracji, bo ta może wskazywać alias
+    (np. `…-latest`), a rachunek wystawia się za wydanie, które policzyło.
+    """
+    return estimate_usage_and_cost(
+        getattr(response, "usage_metadata", None),
+        model=getattr(response, "model_version", None) or default_model,
+    )
+
+
+def _audio_part(audio_path: Path, mime_type: str | None):
+    return types.Part.from_bytes(
+        data=audio_path.read_bytes(),
+        mime_type=resolve_audio_mime(audio_path.suffix, mime_type),
+    )
+
+
+def _parse(response, schema):
     parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, DokumentacjaDraft):
+    if isinstance(parsed, schema):
         return parsed
     try:
-        return DokumentacjaDraft.model_validate_json(response.text)
+        return schema.model_validate_json(response.text)
     except ValueError as exc:
         # Szczegółowa dokumentacja jest długa. Gdy model urwie odpowiedź w pół (limit
         # tokenów, przerwane połączenie), JSON jest niedomknięty — bez tej informacji
@@ -115,33 +136,44 @@ def _parse(response) -> DokumentacjaDraft:
         ) from exc
 
 
-def generate_note_from_audio(
+def generate_documentation(
     audio_path: Path,
     few_shot_examples: list[dict],
     *,
     mime_type: str | None = None,
     visit_type: str | None = None,
-) -> tuple[DokumentacjaDraft, str, dict]:
-    """Wyślij nagranie inline i poproś o dokumentację w schemacie `DokumentacjaDraft`.
+    with_transcript: bool = True,
+):
+    """Dokumentacja z nagrania, wysłanego inline.
 
-    Inline działa i na Vertex AI, i na Developer API — Vertex nie ma Files API,
-    więc to jedyna ścieżka wspólna dla obu.
+    `with_transcript=True` — model pisze też transkrypcję (odpowiedź `DokumentacjaDraft`).
+    `with_transcript=False` — tylko sekcje (`DokumentacjaSekcje`), bo transkrypcję robi
+    równolegle osobny model. Inline działa i na Vertex AI, i na Developer API — Vertex
+    nie ma Files API, więc to jedyna ścieżka wspólna dla obu.
     """
-    client = _client()
-    mime = resolve_audio_mime(audio_path.suffix, mime_type)
-    audio_part = types.Part.from_bytes(
-        data=audio_path.read_bytes(),
-        mime_type=mime,
+    schema = DokumentacjaDraft if with_transcript else DokumentacjaSekcje
+    prompt = build_user_prompt(
+        few_shot_examples, transcript=None, visit_type=visit_type, with_transcript=with_transcript
     )
-    prompt = build_user_prompt(few_shot_examples, transcript=None, visit_type=visit_type)
-
-    response = client.models.generate_content(
+    response = _client().models.generate_content(
         model=GEMINI_MODEL,
-        contents=[prompt, audio_part],
-        config=_generation_config(),
+        contents=[prompt, _audio_part(audio_path, mime_type)],
+        config=_generation_config(schema),
     )
-    usage = _usage_of(response)
-    return _parse(response), prompt, usage
+    return _parse(response, schema), prompt, _usage_of(response, GEMINI_MODEL)
+
+
+def transcribe(audio_path: Path, *, mime_type: str | None = None) -> tuple[str, dict]:
+    """Dosłowna transkrypcja szybszym modelem — zwykły tekst, bez schematu JSON."""
+    response = _client().models.generate_content(
+        model=TRANSCRIPTION_MODEL,
+        contents=[_audio_part(audio_path, mime_type)],
+        config=_transcription_config(),
+    )
+    text = (response.text or "").strip()
+    if text.strip(" .") == NO_SPEECH_MARKER:
+        text = ""
+    return text, _usage_of(response, TRANSCRIPTION_MODEL)
 
 
 def generate_note_from_text(
@@ -156,7 +188,6 @@ def generate_note_from_text(
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[prompt],
-        config=_generation_config(),
+        config=_generation_config(DokumentacjaDraft),
     )
-    usage = _usage_of(response)
-    return _parse(response), prompt, usage
+    return _parse(response, DokumentacjaDraft), prompt, _usage_of(response, GEMINI_MODEL)

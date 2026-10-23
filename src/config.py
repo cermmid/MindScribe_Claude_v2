@@ -92,6 +92,30 @@ def thinking_budget_for(model: str, budget: int) -> int:
     return max(budget, _MIN_THINKING_BUDGET.get((model or "").strip().lower(), 0))
 
 
+def _bool_setting(name: str, default: bool) -> bool:
+    """Przełącznik z env albo sekretów, z wartością domyślną tylko przy BRAKU wpisu.
+
+    Nie przez `or`: `False` z TOML-a jest dla `or` tak samo „puste" jak brak wpisu,
+    więc przy domyślnie włączonym przełączniku `= false` byłoby po cichu ignorowane.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        raw = _from_secrets(name)
+    if raw is None or raw == "":
+        return default
+    return _as_bool(raw)
+
+
+# Transkrypcja osobnym, szybszym modelem, równolegle z dokumentacją. Dosłowna
+# transkrypcja to największa część tekstu, który model pisze token po tokenie —
+# a przy jednym wywołaniu pisał ją ten sam, wolniejszy model, przed dokumentacją.
+# Teraz czas czekania to dłuższe z dwóch wywołań, nie ich suma.
+SEPARATE_TRANSCRIPTION = _bool_setting("SEPARATE_TRANSCRIPTION", True)
+TRANSCRIPTION_MODEL = (
+    os.getenv("TRANSCRIPTION_MODEL") or _from_secrets("TRANSCRIPTION_MODEL") or "gemini-2.5-flash"
+)
+
+
 USE_VERTEX_AI = _as_bool(os.getenv("USE_VERTEX_AI") or _from_secrets("USE_VERTEX_AI") or "false")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or _from_secrets("GCP_PROJECT_ID") or ""
 GCP_LOCATION = os.getenv("GCP_LOCATION") or _from_secrets("GCP_LOCATION") or "europe-west4"

@@ -42,8 +42,8 @@ wtedy, gdy temat został poruszony i pacjent zaprzeczył. Jeśli nie pytano — 
 niejasne lub sprzeczne informacje, nieustalone dawki, niepewne nazwy leków, nieczytelne \
 fragmenty. Każda jednym zdaniem, ze wskazaniem sekcji.
 - Nagranie bez zrozumiałej mowy (cisza, szum, uszkodzenie): `jakosc_nagrania` = BRAK_MOWY, \
-`raw_transcript` puste, wszystkie sekcje puste, `j_bezpieczenstwo.status` = NIE_OCENIANO. \
-Nie twórz żadnej treści — pusta dokumentacja jest tu jedyną poprawną odpowiedzią.
+wszystkie sekcje puste, `j_bezpieczenstwo.status` = NIE_OCENIANO. Nie twórz żadnej treści — \
+pusta dokumentacja jest tu jedyną poprawną odpowiedzią.
 - PRZYKŁADY zatwierdzonej dokumentacji, jeśli są dołączone, pokazują wyłącznie sposób \
 pisania tej osoby. Nigdy nie przenoś z nich treści, objawów, leków ani dawek.
 """
@@ -83,13 +83,37 @@ def build_few_shot_block(examples: list[dict]) -> str:
     return "\n".join(blocks)
 
 
+TRANSCRIPTION_PROMPT = """\
+Przepisz dosłownie rozmowę z załączonego nagrania konsultacji lekarskiej, po polsku.
+
+- Zapisuj wyłącznie to, co faktycznie słychać. Nie streszczaj, nie poprawiaj sensu, \
+nie uzupełniaj niedosłyszanych fragmentów.
+- Każdą wypowiedź zaczynaj od nowej linii, od oznaczenia mówiącego: „Lekarz:" albo \
+„Pacjent:". Gdy nie da się rozpoznać, kto mówi, użyj „Osoba 1:" i „Osoba 2:".
+- Fragment niezrozumiały oznacz jako [niezrozumiałe], zamiast zgadywać — szczególnie \
+nazwy leków i dawki.
+- Jeśli w nagraniu nie ma zrozumiałej mowy, odpowiedz jednym słowem: [BRAK MOWY].
+- Odpowiedz samym tekstem transkrypcji, bez wstępu i bez komentarza.
+"""
+
+# Znacznik, którym model transkrypcji zgłasza nieme nagranie. Zamieniamy go na pusty
+# tekst — w aplikacji „brak transkrypcji" ma jedną postać, a nie dwie.
+NO_SPEECH_MARKER = "[BRAK MOWY]"
+
+
 def build_user_prompt(
     few_shot_examples: list[dict],
     transcript: str | None = None,
     *,
     visit_type: str | None = None,
+    with_transcript: bool = True,
 ) -> str:
-    """Polecenie dla jednej wizyty. Z `transcript` — praca na tekście, bez — na nagraniu."""
+    """Polecenie dla jednej wizyty. Z `transcript` — praca na tekście, bez — na nagraniu.
+
+    `with_transcript=False`: transkrypcję robi osobny model, więc ten ma tylko słuchać
+    i pisać dokumentację. Wtedy schemat odpowiedzi nie ma pola `raw_transcript`
+    i polecenie nie może o nie prosić.
+    """
     parts = [build_few_shot_block(few_shot_examples)]
 
     # Typ wizyty zmienia sens sekcji Q („zmiany od poprzedniej wizyty") i D. Bez tej
@@ -103,13 +127,24 @@ def build_user_prompt(
     if transcript:
         parts.append(f"### TRANSKRYPCJA KONSULTACJI\n{transcript}\n")
         parts.append("Przygotuj dokumentację zgodnie z poleceniem i schematem.")
-    else:
+    elif with_transcript:
         parts.append(
             "### NAGRANIE KONSULTACJI\n"
             "W załączeniu nagranie audio konsultacji.\n"
             "1. Najpierw oceń, czy nagranie zawiera zrozumiałą mowę.\n"
             "2. Jeśli TAK — przepisz dosłowną transkrypcję do `raw_transcript`, a następnie "
             "przygotuj dokumentację na jej podstawie.\n"
+            "3. Jeśli NIE — `raw_transcript` zostaw puste i postąp zgodnie z zasadą "
+            "o nagraniu bez zrozumiałej mowy."
+        )
+    else:
+        parts.append(
+            "### NAGRANIE KONSULTACJI\n"
+            "W załączeniu nagranie audio konsultacji. Transkrypcję przygotowuje osobny "
+            "proces — Ty jej nie przepisujesz.\n"
+            "1. Najpierw oceń, czy nagranie zawiera zrozumiałą mowę.\n"
+            "2. Jeśli TAK — wysłuchaj całego nagrania uważnie i przygotuj dokumentację "
+            "bezpośrednio na jego podstawie.\n"
             "3. Jeśli NIE — postąp zgodnie z zasadą o nagraniu bez zrozumiałej mowy."
         )
     return "\n".join(p for p in parts if p)

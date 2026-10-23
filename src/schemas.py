@@ -115,9 +115,13 @@ def _sekcja(litera: str) -> str:
     )
 
 
-class DokumentacjaDraft(BaseModel):
-    """Odpowiedź modelu — szkic do weryfikacji, nigdy dokument ostateczny."""
+# Schemat składamy z trzech części, żeby z tych samych pól powstały dwa warianty
+# odpowiedzi. Pydantic układa pola klas bazowych od OSTATNIEJ na liście dziedziczenia,
+# więc `class X(_Tresc, _Transkrypcja, _Jakosc)` daje kolejność: jakość, transkrypcja,
+# sekcje. Kolejność pilnują testy — Gemini generuje pola dokładnie w tej kolejności.
 
+
+class _Jakosc(BaseModel):
     jakosc_nagrania: JakoscNagrania = Field(
         description=(
             "Ocena użyteczności nagrania. BRAK_MOWY — w nagraniu nie ma zrozumiałej mowy "
@@ -126,6 +130,9 @@ class DokumentacjaDraft(BaseModel):
             "wyraźnie wypowiedzi, wpisz BRAK_MOWY i zostaw pozostałe pola puste."
         )
     )
+
+
+class _Transkrypcja(BaseModel):
     raw_transcript: str = Field(
         description=(
             "Dosłowna transkrypcja tego, co faktycznie słychać w nagraniu, po polsku. "
@@ -133,6 +140,9 @@ class DokumentacjaDraft(BaseModel):
             "Pod żadnym pozorem nie wymyślaj treści ani nie przenoś jej z przykładów."
         )
     )
+
+
+class _Tresc(BaseModel):
     a_dane_ogolne: str = Field(default="", description=_sekcja("A"))
     b_powod_zgloszenia: str = Field(default="", description=_sekcja("B"))
     c_aktualne_objawy: str = Field(default="", description=_sekcja("C"))
@@ -167,6 +177,27 @@ class DokumentacjaDraft(BaseModel):
             "Pusta lista, gdy nie ma czego sprawdzać."
         ),
     )
+
+
+class DokumentacjaSekcje(_Tresc, _Jakosc):
+    """Odpowiedź modelu dokumentacji, gdy transkrypcję robi osobny, szybszy model.
+
+    Bez pola transkrypcji: to ona była największą częścią tekstu, który model pisał
+    token po tokenie. Model nadal SŁYSZY całe nagranie — nie musi go tylko przepisywać.
+    """
+
+
+class DokumentacjaDraft(_Tresc, _Transkrypcja, _Jakosc):
+    """Pełny szkic do weryfikacji, nigdy dokument ostateczny.
+
+    W trybie jednego wywołania to jest odpowiedź modelu. W trybie osobnej transkrypcji
+    aplikacja składa go z `DokumentacjaSekcje` i tekstu od modelu transkrypcji —
+    reszta aplikacji (zapis, widoki, historia) widzi zawsze ten sam kształt.
+    """
+
+    @classmethod
+    def from_parts(cls, sekcje: "DokumentacjaSekcje", transkrypcja: str) -> "DokumentacjaDraft":
+        return cls(**sekcje.model_dump(), raw_transcript=(transkrypcja or "").strip())
 
 
 class ZatwierdzonaDokumentacja(BaseModel):

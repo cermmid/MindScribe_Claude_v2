@@ -16,11 +16,11 @@ Zatwierdzona dokumentacja jest doklejana do kolejnych promptów jako **wzorzec s
 ## Stack
 
 - **UI + backend**: Python 3.11+, Streamlit (multi-page)
-- **AI**: Gemini 2.5 Pro przez `google-genai` SDK, Structured Outputs (Pydantic → `response_schema`)
+- **AI**: Gemini 2.5 Pro (dokumentacja) i Gemini 2.5 Flash (transkrypcja, równolegle) przez `google-genai` SDK, Structured Outputs (Pydantic → `response_schema`)
 - **Prompt kliniczny**: zwykły plik tekstowy `prompts/dokumentacja.md` — poprawiasz go bez dotykania kodu (patrz niżej)
-- **Audio**: przesyłane inline i analizowane multimodalnie (transkrypcja + dokumentacja w jednym wywołaniu). Files API odpada — nie istnieje w Vertex AI
+- **Audio**: przesyłane inline i analizowane multimodalnie — oba modele słuchają nagrania jednocześnie. Files API odpada — nie istnieje w Vertex AI
 - **Baza**: PostgreSQL przez SQLAlchemy (lokalnie SQLite bez konfiguracji)
-- **Logowanie**: Auth0 przez natywne `st.login()`
+- **Logowanie**: konto Google przez natywne `st.login()`, z listą dozwolonych adresów
 
 ## Uruchomienie lokalne
 
@@ -30,7 +30,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-# uzupełnij klucz Gemini oraz sekcje [auth] i [auth.auth0] — patrz niżej
+# uzupełnij klucz Gemini oraz sekcje [auth] i [auth.google] — patrz niżej
 
 streamlit run app.py
 ```
@@ -57,11 +57,12 @@ MindScribe/
 │   ├── formatting.py         # odpowiedź modelu → jeden dokument tekstowy
 │   ├── db.py                 # SQLAlchemy: visits, filtr właściciela, agregaty panelu
 │   ├── services.py           # przypadki użycia — bez zależności od UI
-│   ├── auth.py               # logowanie OIDC, tożsamość użytkownika
+│   ├── auth.py               # logowanie Google, lista dozwolonych adresów, tożsamość
 │   ├── audio.py              # zapis uploadu, typ MIME, wykrywanie ciszy
-│   └── gemini_client.py      # generate_note_from_audio() — audio inline + Structured Output
+│   ├── pricing.py            # wycena zużycia per model, suma dwóch wywołań
+│   └── gemini_client.py      # generate_documentation() i transcribe() — audio inline
 ├── admin/app.py              # panel właściciela (osobne hasło)
-├── tests/                    # 130 testów; db też na Postgresie przez TEST_DATABASE_URL
+├── tests/                    # 159 testów; db też na Postgresie przez TEST_DATABASE_URL
 └── data/                     # lokalny SQLite i nagrania (gitignored)
 ```
 
@@ -78,7 +79,7 @@ Co ta wersja musi mieć **własne**:
 | Zasób | Dlaczego osobny |
 |---|---|
 | Projekt Neon (region UE) i `DATABASE_URL` | Patrz punkty 1 i 2 wyżej |
-| Aplikacja Auth0 z własnym adresem powrotu | Inny adres aplikacji = inny `redirect_uri` |
+| Klient OAuth Google z własnym adresem powrotu | Inny adres aplikacji = inny `redirect_uri` |
 | `cookie_secret` | Patrz punkt 3 |
 | Aplikacja na Streamlit Cloud (inny adres) | Inaczej nadpisałaby pierwszą wersję |
 | `admin_password` do panelu właściciela | Osobne dane, osobny dostęp |
@@ -105,42 +106,61 @@ Cel: wysyłasz link, a odbiorca zakłada konto i korzysta — nic nie instaluje.
    GEMINI_API_KEY = "..."
    GEMINI_MODEL = "gemini-2.5-pro"
    GEMINI_THINKING_BUDGET = 8192
-   # logowanie: patrz sekcja "Logowanie i separacja danych"
+   ALLOWED_EMAILS = ["lekarz@gmail.com"]
+   DATABASE_URL = "postgresql://..."
+   # [auth] i [auth.google] NA SAMYM KOŃCU — patrz sekcja "Logowanie i separacja danych"
    ```
+   ⚠️ Kolejność ma znaczenie. W TOML-u każdy klucz pod nagłówkiem `[auth.google]` należy do tej tabeli — wpisany tam `DATABASE_URL` aplikacja po prostu nie zobaczy i po cichu użyje znikającego SQLite. Wszystkie zwykłe klucze idą na górę, tabele `[auth]` na dół (tak jak w `.streamlit/secrets.toml.example`).
 5. **Deploy**. Po ~2 minutach apka żyje. Wysyłasz lekarzowi:
    > Link: https://mindscribe-v2.streamlit.app
-   > Konto zakładasz sam przy pierwszym wejściu.
+   > Logujesz się swoim kontem Google (adres musi być na liście `ALLOWED_EMAILS`).
 
 Każdy push do tego brancha automatycznie redeployuje apkę.
 
 ### Ograniczenia darmowego hostingu — przeczytaj zanim wyślesz link
 
 - **Nagrania znikają przy restarcie.** Streamlit Cloud ma efemeryczny dysk. Wizyty i konta są bezpieczne, bo baza jest zewnętrzna (patrz *Baza danych*), ale pliki audio z `data/audio/` kasują się przy redeployu. Nagranie i tak jest potrzebne wyłącznie na czas przygotowania dokumentacji.
-- **URL jest publiczny**, ale bez konta nie widać niczego — logowanie idzie przez Auth0.
+- **URL jest publiczny**, ale bez logowania nie widać niczego — a z listą `ALLOWED_EMAILS` wchodzą tylko wymienione osoby.
 - **~1 GB RAM, 1 CPU**. Wystarczy kilku osobom i plikom do ~200 MB.
 - **Brak BAA z Google**. ZERO realnych danych pacjentów na tym deploy'u. Fikcyjne nagrania tylko.
 
 ## Logowanie i separacja danych
 
-Każdy specjalista ma własne konto i **widzi wyłącznie swoje wizyty**. Logowanie idzie przez Auth0 natywnym `st.login()`, więc aplikacja nie przechowuje żadnych haseł, a sesja żyje w podpisanym ciasteczku — odświeżenie strony ani wygaszony ekran telefonu nie wylogowują.
+Każdy specjalista loguje się **własnym kontem Google** i **widzi wyłącznie swoje wizyty**. Logowanie idzie natywnym `st.login()`, więc aplikacja nie przechowuje żadnych haseł, a sesja żyje w podpisanym ciasteczku — odświeżenie strony ani wygaszony ekran telefonu nie wylogowują.
 
-### Konfiguracja Auth0 (10 min)
+### Kto może wejść — `ALLOWED_EMAILS`
 
-1. Konto na auth0.com → **Applications** → **Create Application** → typ **Regular Web Application**. Technologia „Python" (nie React ani inny SPA — te nie dostają Client Secret, a Streamlit go potrzebuje).
-2. W *Settings* aplikacji uzupełnij:
-   - **Allowed Callback URLs** — każdy adres, pod którym aplikacja działa, z końcówką `/oauth2callback`. To lista, więc wpisz oba: lokalny i produkcyjny.
-     ```
-     http://localhost:8501/oauth2callback, https://TWOJA-APKA.streamlit.app/oauth2callback
-     ```
-   - **Allowed Logout URLs** — te same adresy, ale **bez** `/oauth2callback`.
-3. Przepisz `Domain`, `Client ID` i `Client Secret` do sekretów (patrz `.streamlit/secrets.toml.example`). `server_metadata_url` to `https://TWOJA-DOMENA/.well-known/openid-configuration`.
-4. Wygeneruj `cookie_secret`: `python -c "import secrets; print(secrets.token_hex(32))"`.
+Zalogować się kontem Google może każdy, kto je ma, a każda wizyta kosztuje i trafia do bazy. Dlatego jest lista dozwolonych adresów:
 
-⚠️ `redirect_uri` w sekretach musi **dokładnie** odpowiadać adresowi wpisanemu w Auth0. Lokalnie i na produkcji są to dwa różne adresy — na Streamlit Cloud w sekretach wpisz ten produkcyjny.
+```toml
+ALLOWED_EMAILS = ["lekarz@gmail.com", "druga.osoba@example.com"]
+```
+
+- Adres musi być na liście **i być zweryfikowany przez Google** — niezweryfikowanego adresu nie traktujemy jako dowodu tożsamości.
+- Wielkość liter nie ma znaczenia. W `.env` lista idzie po przecinku: `ALLOWED_EMAILS=a@x.pl,b@x.pl`.
+- **Pusta lista wpuszcza każdego** z kontem Google. Używaj tego wyłącznie lokalnie.
+- Osoba spoza listy widzi komunikat i przycisk wylogowania — do aplikacji nie wejdzie.
+
+### Konfiguracja logowania Google (10 min)
+
+Klient OAuth zakładasz w tym samym projekcie Google Cloud, w którym działa Vertex AI.
+
+1. **Google Cloud Console** → **APIs & Services → OAuth consent screen** (Ekran zgody OAuth). Typ użytkownika **External**, nazwa aplikacji, e-mail kontaktowy. Zakresy: wystarczą domyślne `openid`, `email`, `profile`.
+2. Dopóki aplikacja jest w trybie **Testing**, w **Test users** dopisz adresy osób, które mają się logować — inne konta Google zobaczą błąd jeszcze przed aplikacją. To druga, niezależna od `ALLOWED_EMAILS` warstwa.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID** → typ **Web application**.
+4. **Authorized redirect URIs** — każdy adres, pod którym aplikacja działa, z końcówką `/oauth2callback`:
+   ```
+   http://localhost:8501/oauth2callback
+   https://mindscribe-v2.streamlit.app/oauth2callback
+   ```
+5. Przepisz **Client ID** i **Client Secret** do sekcji `[auth.google]` w sekretach. `server_metadata_url` jest stały: `https://accounts.google.com/.well-known/openid-configuration`.
+6. Wygeneruj `cookie_secret`: `python -c "import secrets; print(secrets.token_hex(32))"` — **inny niż w pierwszej wersji**.
+
+⚠️ `redirect_uri` w sekcji `[auth]` musi **dokładnie** odpowiadać jednemu z adresów z punktu 4. Lokalnie i na produkcji są to dwa różne adresy — na Streamlit Cloud w sekretach wpisz ten produkcyjny.
 
 ### Jak działa separacja
 
-Kluczem właściciela jest `st.user.sub` — stabilny identyfikator od dostawcy, nie e-mail (ten użytkownik może zmienić, tracąc dostęp do własnych wizyt). Nazwa do wyświetlania jest w osobnej kolumnie `doctor_name`.
+Kluczem właściciela jest `st.user.sub` — stabilny identyfikator od Google, nie e-mail (ten użytkownik może zmienić, tracąc dostęp do własnych wizyt). Nazwa do wyświetlania jest w osobnej kolumnie `doctor_name`.
 
 **Filtr właściciela zawodzi zamknięciem.** Parametr jest wymagany we wszystkich funkcjach czytających i piszących; pominięcie go to `TypeError`, a nie ciche „pokaż wszystko". Świadome zapytanie o wszystkich wymaga jawnego `ALL_USERS` — widocznego w kodzie i w przeglądzie zmian. Wcześniej domyślne `None` znaczyło „bez filtrowania", więc jedna zapomniana linia pokazywała cudze wizyty i nic tego nie sygnalizowało.
 
@@ -188,7 +208,7 @@ Aplikacja dokleja do niego tylko krótki blok **reguł technicznych** (`src/prom
 
 ### Jak powstaje dokumentacja
 
-1. Model słucha nagrania i zwraca **ustrukturyzowaną odpowiedź**: transkrypcję, sekcje A–Q, osobny opis każdego leku (sekcja E), status bezpieczeństwa (sekcja J) i listę kwestii do sprawdzenia.
+1. Dwa modele słuchają nagrania **jednocześnie**. Gemini 2.5 Pro zwraca **ustrukturyzowaną dokumentację**: sekcje A–Q, osobny opis każdego leku (sekcja E), status bezpieczeństwa (sekcja J) i listę kwestii do sprawdzenia. Gemini 2.5 Flash w tym samym czasie pisze **dosłowną transkrypcję** (szczegóły w *Model i koszty*).
 2. Aplikacja składa z tego **jeden dokument tekstowy**, który lekarz poprawia w całości i zatwierdza.
 3. Zatwierdzony tekst trafia do bazy i staje się wzorcem stylu dla kolejnych wizyt tej osoby.
 
@@ -210,24 +230,43 @@ Nie proponuje rozpoznań ani kodów ICD/DSM, nie dopisuje własnych sugestii ter
 
 Domyślnie **`gemini-2.5-pro`** z budżetem myślenia **8192**. Przeszliśmy na niego z Flasha, bo przy długiej wizycie Flash mylił objawy aktualne z tymi, którym pacjent zaprzeczył albo które ustąpiły.
 
-Trzy pokrętła zmieniasz w sekretach, bez ruszania kodu (wymagają restartu aplikacji):
+Pokrętła zmieniasz w sekretach, bez ruszania kodu (wymagają restartu aplikacji):
 
 | Zmienna | Domyślnie | Do czego |
 |---|---|---|
 | `GEMINI_MODEL` | `gemini-2.5-pro` | Zmiana modelu. Nieznany model jest wyceniany najdroższą znaną stawką i oznaczany w panelu. |
 | `GEMINI_THINKING_BUDGET` | `8192` | Tyle wynosi domyślna wartość Google dla 2.5 Pro. Niżej = taniej i gorzej; `-1` = model decyduje sam, ale koszt przestaje być przewidywalny. Pro nie umie wyłączyć myślenia — wartości poniżej 128 są podnoszone do 128. |
+| `SEPARATE_TRANSCRIPTION` | `true` | Transkrypcja osobnym modelem, równolegle z dokumentacją. `false` wraca do jednego wywołania — patrz niżej. |
+| `TRANSCRIPTION_MODEL` | `gemini-2.5-flash` | Model transkrypcji. Pracuje bez myślenia — przepisanie rozmowy nie wymaga rozumowania. |
 | `FEW_SHOT_LIMIT` | `3` | Ile zatwierdzonych dokumentacji trafia do promptu jako wzorzec stylu. `0` je wyłącza — użyj, gdyby model zaczął przenosić treść ze starych wizyt do nowej dokumentacji. |
 
-Orientacyjny koszt i czas na **2.5 Pro z myśleniem 8192**, policzone modułem `src/pricing.py`:
+### Transkrypcja osobno, równolegle
 
-| Wizyta | Koszt | Tokeny wyjścia | Samo generowanie wyjścia |
+**Rachunek i czas zależą głównie od wyjścia, nie od audio** — model pisze tekst token po tokenie. Na wyjście składają się trzy rzeczy: myślenie (8192), szczegółowa dokumentacja A–Q i dosłowna transkrypcja. Przy jednym wywołaniu wszystkie trzy pisał Pro, jedna po drugiej, a transkrypcja była z nich najdłuższa.
+
+Teraz są **dwa wywołania naraz**:
+
+- **Gemini 2.5 Pro** słucha całego nagrania i pisze wyłącznie dokumentację — bez przepisywania rozmowy.
+- **Gemini 2.5 Flash** w tym samym czasie pisze dosłowną transkrypcję, jako zwykły tekst, bez myślenia.
+
+Czas oczekiwania to **dłuższe z dwóch wywołań, nie ich suma** — w praktyce czas Pro, który ma teraz o jedną trzecią do połowy mniej do napisania. Dokumentacji nie skracamy, bo prompt kliniczny stawia kompletność ponad zwięzłość.
+
+Orientacyjnie, policzone modułem `src/pricing.py` (szacunki — prawdziwe czasy widać po każdej wizycie i w panelu właściciela):
+
+| Wizyta | Koszt: jedno wywołanie → dwa | Wyjście Pro: jedno → dwa | Generowanie: jedno → dwa |
 |---|---|---|---|
-| 20 min | ≈ $0,26 | ~19 tys. | ~2–4 min |
-| 45 min | ≈ $0,42 | ~29 tys. | ~3–6 min |
+| 20 min | ≈ $0,25 → ≈ $0,24 | ~19 tys. → ~13 tys. | ~2–4 min → ~1,5–3 min |
+| 45 min | ≈ $0,41 → ≈ $0,39 | ~29 tys. → ~16 tys. | ~3–6 min → ~2–3,5 min |
 
-**Rachunek i czas zależą głównie od wyjścia, nie od audio.** Na wyjście składają się trzy rzeczy: myślenie (8192), szczegółowa dokumentacja A–Q i — największa — **dosłowna transkrypcja**, którą model też pisze token po tokenie. Wcześniejszy szacunek ($0,23 za 45 minut) zakładał 2 500 tokenów wyjścia i był zaniżony, bo nie mieścił nawet transkrypcji.
+Koszt praktycznie się nie zmienia: Flash dolicza drugie przesłuchanie audio, ale Pro nie płaci za transkrypcję po swojej, czterokrotnie wyższej stawce wyjścia. W bazie zapisuje się suma obu wywołań, a tokeny audio liczą się raz — z nich aplikacja odtwarza długość wizyty.
 
-Jeśli czas generowania okaże się za długi, pierwszą dźwignią jest transkrypcja, a nie dokumentacja: można ją robić osobno, szybszym modelem i równolegle. Dokumentacji nie skracamy, bo prompt kliniczny stawia kompletność ponad zwięzłość. Aplikacja mierzy etapy generowania (widać je po każdej wizycie i w panelu właściciela), więc decyzja może opierać się na pomiarach.
+Co się dzieje, gdy coś pójdzie nie tak:
+
+- **Transkrypcja się nie uda** → wizyta powstaje normalnie, bez transkrypcji, a na liście „do sprawdzenia" pojawia się informacja, że nie ma z czym porównać dokumentacji. Lekarz nie czeka drugi raz.
+- **Dokumentacja się nie uda** → błąd, jak wcześniej — to ona jest tym, po co lekarz przyszedł.
+- **Modele różnie ocenią nagranie** (Pro nie słyszy mowy, Flash ją przepisał) → informacja na liście „do sprawdzenia", zamiast cichej pustej dokumentacji.
+
+**Powrót do jednego wywołania**: `SEPARATE_TRANSCRIPTION = false` w sekretach i restart, bez wdrażania. Warto go mieć pod ręką z jednego powodu: przy jednym wywołaniu Pro najpierw przepisywał rozmowę, a potem pisał dokumentację, mając ją przed sobą. Teraz pisze ją wprost ze słuchania. Jeśli na prawdziwych nagraniach dokumentacja zacznie gubić szczegóły albo mylić, kto co powiedział — to jest pierwsze podejrzenie i pierwszy test.
 
 ⚠️ **Stawki w `src/pricing.py` pochodzą ze źródeł wtórnych i wymagają potwierdzenia** w konsoli Google Cloud. Cała tabela do poprawienia siedzi w jednym bloku na górze pliku; po sprawdzeniu ustaw tam `PRICES_ARE_PROVISIONAL = False`, żeby zniknęła informacja w panelu.
 

@@ -253,3 +253,36 @@ def estimate_usage_and_cost(usage_metadata, *, model: str) -> dict:
         "pricing_known": pricing_known,
         "pricing_tier": tier,
     }
+
+
+def merge_usage(primary: dict, secondary: dict | None) -> dict:
+    """Zużycie dwóch wywołań tej samej wizyty jako jeden rekord.
+
+    Tokeny i koszt się sumują — rachunek przychodzi za oba wywołania. Tokeny audio
+    NIE: oba modele słuchały tego samego nagrania, a z tej liczby aplikacja odtwarza
+    długość wizyty, więc suma dawałaby wizytę dwa razy dłuższą niż w rzeczywistości.
+    Cena jest znana tylko wtedy, gdy znamy ją dla obu modeli.
+    """
+    if not secondary:
+        return dict(primary)
+    merged = dict(primary)
+    for key in ("prompt_tokens", "output_tokens", "thoughts_tokens", "total_tokens", "prompt_text_tokens"):
+        merged[key] = int(primary.get(key, 0) or 0) + int(secondary.get(key, 0) or 0)
+    merged["estimated_cost_usd"] = round(
+        float(primary.get("estimated_cost_usd", 0.0) or 0.0)
+        + float(secondary.get("estimated_cost_usd", 0.0) or 0.0),
+        6,
+    )
+    merged["prompt_audio_tokens"] = max(
+        int(primary.get("prompt_audio_tokens", 0) or 0),
+        int(secondary.get("prompt_audio_tokens", 0) or 0),
+    )
+    merged["modality_known"] = bool(primary.get("modality_known")) and bool(
+        secondary.get("modality_known")
+    )
+    merged["pricing_known"] = bool(primary.get("pricing_known", True)) and bool(
+        secondary.get("pricing_known", True)
+    )
+    models = [m for m in (primary.get("model"), secondary.get("model")) if m]
+    merged["model"] = " + ".join(dict.fromkeys(models))
+    return merged

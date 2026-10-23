@@ -12,15 +12,27 @@ Reguły zakodowane w tym pliku:
 """
 
 import json
+import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import config
 from .audio import save_uploaded_audio
 from .db import get_approved_examples, get_visit, insert_visit, update_visit
 from .formatting import draft_to_document, risk_status
-from .schemas import DokumentacjaDraft, JakoscNagrania, Ryzyko, ZatwierdzonaDokumentacja
+from .pricing import merge_usage
+from .schemas import (
+    DokumentacjaDraft,
+    DokumentacjaSekcje,
+    JakoscNagrania,
+    Ryzyko,
+    ZatwierdzonaDokumentacja,
+)
+
+log = logging.getLogger(__name__)
 
 # `gemini_client` ciągnie za sobą cały SDK Google, więc importujemy go leniwie —
 # czyste reguły z tego modułu dają się wtedy testować bez SDK.
@@ -54,9 +66,16 @@ class Timings:
     zapis_audio: float = 0.0
     model: float = 0.0
     calosc: float = 0.0
+    # `None` w trybie jednego wywołania — wtedy transkrypcja jest częścią czasu modelu.
+    transkrypcja: float | None = None
 
     def summary(self) -> str:
-        return f"model {self.model:.0f} s · zapis {self.zapis_audio:.0f} s"
+        if self.transkrypcja is None:
+            return f"model {self.model:.0f} s · zapis {self.zapis_audio:.0f} s"
+        return (
+            f"dokumentacja {self.model:.0f} s · transkrypcja {self.transkrypcja:.0f} s "
+            f"(równolegle) · zapis {self.zapis_audio:.0f} s"
+        )
 
 
 @dataclass
@@ -94,6 +113,7 @@ def create_visit_from_audio(
     doctor_name: str | None = None,
     few_shot: list[dict[str, str]] | None = None,
     pipeline: str = "multimodal",
+    separate_transcription: bool | None = None,
 ) -> CreatedVisit:
     """Pełna ścieżka: zapis audio → few-shot → Gemini → zapis wizyty jako szkic.
 
@@ -101,10 +121,11 @@ def create_visit_from_audio(
     dostępny — bez niego zgadujemy z rozszerzenia, a przy nagraniu z mikrofonu
     rozszerzenie bywa nieprawdziwe.
 
-    Wyjątki z wywołania Gemini są propagowane — wołający decyduje, jak je pokazać.
-    """
-    from .gemini_client import generate_note_from_audio
+    `separate_transcription=None` bierze ustawienie `SEPARATE_TRANSCRIPTION`.
 
+    Wyjątki z wywołania dokumentacji są propagowane — wołający decyduje, jak je pokazać.
+    Awaria samej transkrypcji wizyty nie przerywa (patrz `_generate_in_parallel`).
+    """
     if not audio_bytes:
         raise ValueError("Brak danych audio.")
 
@@ -115,15 +136,27 @@ def create_visit_from_audio(
     audio_path: Path = save_uploaded_audio(audio_bytes, suffix=audio_suffix)
     after_save = time.monotonic()
 
-    draft, debug_prompt, usage = generate_note_from_audio(
-        audio_path, few_shot, mime_type=audio_mime, visit_type=visit_type
-    )
-    after_model = time.monotonic()
+    if separate_transcription is None:
+        separate_transcription = config.SEPARATE_TRANSCRIPTION
+
+    if separate_transcription:
+        draft, debug_prompt, usage, model_s, transcription_s = _generate_in_parallel(
+            audio_path, few_shot, mime_type=audio_mime, visit_type=visit_type
+        )
+    else:
+        from .gemini_client import generate_documentation
+
+        draft, debug_prompt, usage = generate_documentation(
+            audio_path, few_shot, mime_type=audio_mime, visit_type=visit_type
+        )
+        model_s, transcription_s = time.monotonic() - after_save, None
+    finished = time.monotonic()
 
     timings = Timings(
         zapis_audio=after_save - started,
-        model=after_model - after_save,
-        calosc=after_model - started,
+        model=model_s,
+        calosc=finished - started,
+        transkrypcja=transcription_s,
     )
 
     visit_id = insert_visit(
@@ -146,6 +179,71 @@ def create_visit_from_audio(
         few_shot_count=len(few_shot),
         timings=timings,
     )
+
+
+TRANSCRIPTION_FAILED_NOTE = (
+    "Transkrypcja nie powiodła się — dokumentacja powstała bezpośrednio z nagrania, "
+    "ale nie ma do czego jej porównać. Przed zatwierdzeniem odsłuchaj kluczowe fragmenty."
+)
+SPEECH_MISMATCH_NOTE = (
+    "Model dokumentacji nie rozpoznał w nagraniu mowy, a transkrypcja ją zawiera. "
+    "Sprawdź transkrypcję — dokumentację trzeba będzie prawdopodobnie wygenerować ponownie."
+)
+
+
+def _timed(fn, *args, **kwargs):
+    started = time.monotonic()
+    result = fn(*args, **kwargs)
+    return result, time.monotonic() - started
+
+
+def _generate_in_parallel(
+    audio_path: Path,
+    few_shot: list[dict[str, str]],
+    *,
+    mime_type: str | None,
+    visit_type: str | None,
+) -> tuple[DokumentacjaDraft, str, dict[str, Any], float, float]:
+    """Dokumentacja i transkrypcja naraz, dwoma modelami. Czas to dłuższe z dwóch.
+
+    Wątki, nie asyncio: oba wywołania to czekanie na sieć, a SDK jest synchroniczne.
+    Dokumentacja jest tym, po co lekarz przyszedł — jej błąd przerywa wizytę. Transkrypcja
+    jest materiałem pomocniczym: gdy się nie uda, wizyta powstaje bez niej, z jawną
+    adnotacją w punktach do weryfikacji, zamiast kazać lekarzowi czekać drugi raz.
+    """
+    from .gemini_client import generate_documentation, transcribe
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="gemini") as pool:
+        doc_future = pool.submit(
+            _timed,
+            generate_documentation,
+            audio_path,
+            few_shot,
+            mime_type=mime_type,
+            visit_type=visit_type,
+            with_transcript=False,
+        )
+        transcript_future = pool.submit(_timed, transcribe, audio_path, mime_type=mime_type)
+
+        # Najpierw dokumentacja: jej wyjątek ma wyjść od razu. `with` i tak poczeka
+        # na transkrypcję przed wyjściem — nie zostawiamy wiszącego wywołania.
+        (sekcje, prompt, doc_usage), model_s = doc_future.result()
+        try:
+            (transcript, transcript_usage), transcription_s = transcript_future.result()
+        except Exception:
+            log.exception("Transkrypcja nie powiodła się; wizyta powstaje bez niej.")
+            transcript, transcript_usage, transcription_s = "", None, 0.0
+            sekcje = _with_review_item(sekcje, TRANSCRIPTION_FAILED_NOTE)
+        else:
+            if transcript and sekcje.jakosc_nagrania == JakoscNagrania.BRAK_MOWY:
+                sekcje = _with_review_item(sekcje, SPEECH_MISMATCH_NOTE)
+
+    draft = DokumentacjaDraft.from_parts(sekcje, transcript)
+    return draft, prompt, merge_usage(doc_usage, transcript_usage), model_s, transcription_s
+
+
+def _with_review_item(sekcje: DokumentacjaSekcje, note: str) -> DokumentacjaSekcje:
+    return sekcje.model_copy(update={"do_weryfikacji": [*sekcje.do_weryfikacji, note]})
 
 
 # --- Przypadek użycia: zatwierdzenie dokumentacji ------------------------------
