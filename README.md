@@ -1,4 +1,11 @@
-# MindScribe
+# MindScribe — wersja druga
+
+> **Czym jest to repo.** Druga wersja aplikacji, odbita z pełną historią z
+> [`cermmid/MindScribe`](https://github.com/cermmid/MindScribe). Pierwsza wersja **działa i zostaje
+> nietknięta** — jest używana na prawdziwych wizytach, więc nie eksperymentujemy na niej.
+>
+> ⚠️ **Ta wersja musi mieć własną bazę i własne logowanie.** To nie jest zalecenie porządkowe,
+> tylko warunek bezpieczeństwa danych — szczegóły w sekcji *Rozdzielenie od pierwszej wersji*.
 
 Aplikacja webowa dla **psychiatrów, psychologów i psychoterapeutów**: nagranie wizyty → transkrypcja i ustrukturyzowana notatka (Gemini 2.5 Flash, Structured Outputs) → korekta i zatwierdzenie przez specjalistę → zapis w bazie.
 
@@ -54,19 +61,41 @@ MindScribe/
 └── data/                     # lokalny SQLite i nagrania (gitignored)
 ```
 
+## Rozdzielenie od pierwszej wersji
+
+Ta wersja **nie może dzielić bazy ani logowania** z `cermmid/MindScribe`. Trzy powody, każdy wystarczający sam z siebie:
+
+1. **Wspólna baza znaczy pisanie do dokumentacji prawdziwych pacjentów.** Pierwsza wersja jest używana na realnych wizytach. Nieudana migracja schematu albo błąd w `update_visit` uderzyłby w notatki, które już istnieją — a tu nie ma kosza, do którego dałoby się sięgnąć.
+2. **Wspólna baza otwiera z powrotem wyciek zamknięty w fazie B.** `load_few_shot_examples` dokleja zatwierdzone notatki do kolejnych promptów. Przy wspólnej bazie notatki z jednej wersji trafiałyby do zapytań drugiej — czyli transkrypcja pacjenta jednej osoby do promptu drugiej.
+3. **Wspólne `cookie_secret` krzyżowo podpisuje sesje.** Dwie aplikacje pod różnymi adresami, ten sam podpis ciasteczka — sesja z jednej bywa uznawana przez drugą.
+
+Co ta wersja musi mieć **własne**:
+
+| Zasób | Dlaczego osobny |
+|---|---|
+| Projekt Neon (region UE) i `DATABASE_URL` | Patrz punkty 1 i 2 wyżej |
+| Aplikacja Auth0 z własnym adresem powrotu | Inny adres aplikacji = inny `redirect_uri` |
+| `cookie_secret` | Patrz punkt 3 |
+| Aplikacja na Streamlit Cloud (inny adres) | Inaczej nadpisałaby pierwszą wersję |
+| `admin_password` do panelu właściciela | Osobne dane, osobny dostęp |
+
+Co **można współdzielić**: poświadczenia Gemini/Vertex AI (`GEMINI_API_KEY` albo service account) i klucze WHO ICD (`ICD_CLIENT_ID`, `ICD_CLIENT_SECRET`). To usługi zewnętrzne odpytywane tylko do odczytu — nie trzymają danych pacjentów i nie ma w nich stanu, który jedna wersja mogłaby zepsuć drugiej.
+
+⚠️ Bez `DATABASE_URL` aplikacja domyślnie używa lokalnego SQLite w `data/`. Na Streamlit Cloud ten plik znika przy każdym restarcie — czyli *wygląda* na działającą i po cichu gubi wizyty. Ustaw `DATABASE_URL` od pierwszego uruchomienia.
+
 ## Deploy (Streamlit Community Cloud)
 
 Cel: wysyłasz link, a odbiorca zakłada konto i korzysta — nic nie instaluje. Darmowe, jeśli repo jest publiczne.
 
 ### Setup jednorazowy (~5 min)
 
-1. Upewnij się, że repo `cermmid/MindScribe` jest **public** na GitHubie i kod jest na branchu `main` (lub innym, który wskażesz w kroku 3).
+1. Upewnij się, że repo `cermmid/MindScribe_Claude_v2` jest **public** na GitHubie i kod jest na branchu `main`.
 2. Wejdź na **https://share.streamlit.io** → zaloguj się kontem GitHub → kliknij **Create app** → **Deploy a public app from GitHub**.
 3. Wskaż:
-   - Repository: `cermmid/MindScribe`
+   - Repository: `cermmid/MindScribe_Claude_v2`
    - Branch: `main`
    - Main file path: `app.py`
-   - App URL: np. `mindscribe-mvp` → dostaniesz `https://mindscribe-mvp.streamlit.app`
+   - App URL: **inny niż pierwsza wersja**, np. `mindscribe-v2` → dostaniesz `https://mindscribe-v2.streamlit.app`
 4. **Advanced settings → Secrets** — wklej (wartości weź ze swojego `.streamlit/secrets.toml`):
    ```toml
    GEMINI_API_KEY = "..."
@@ -75,7 +104,7 @@ Cel: wysyłasz link, a odbiorca zakłada konto i korzysta — nic nie instaluje.
    # logowanie: patrz sekcja "Logowanie i separacja danych"
    ```
 5. **Deploy**. Po ~2 minutach apka żyje. Wysyłasz lekarzowi:
-   > Link: https://mindscribe-mvp.streamlit.app
+   > Link: https://mindscribe-v2.streamlit.app
    > Konto zakładasz sam przy pierwszym wejściu.
 
 Każdy push do tego brancha automatycznie redeployuje apkę.
