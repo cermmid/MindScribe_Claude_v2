@@ -73,7 +73,7 @@ def require_login() -> None:
     st.title("🧠 MindScribe")
     st.subheader("Asystent specjalistów od zdrowia psychicznego")
     st.write(
-        "Zaloguj się, żeby przejść do swoich wizyt. Twoje notatki widzisz wyłącznie Ty."
+        "Zaloguj się, żeby przejść do swoich wizyt. Swoją dokumentację widzisz wyłącznie Ty."
     )
     if st.button("Zaloguj się / Załóż konto", type="primary"):
         st.login(_PROVIDER)

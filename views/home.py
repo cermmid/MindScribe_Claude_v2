@@ -1,27 +1,31 @@
 import streamlit as st
 
 st.title("🧠 MindScribe")
-st.subheader("Asystent specjalistów od zdrowia psychicznego")
+st.subheader("Asystent dokumentacji z konsultacji")
 
 st.markdown(
     """
-Nagraj wizytę i odzyskaj czas, który zwykle pochłania pisanie notatki.
+Nagraj konsultację i odzyskaj czas, który zwykle pochłania jej dokumentowanie.
 
-MindScribe słucha nagrania i przygotowuje gotowy szkic dokumentacji: opis stanu
-psychicznego, objawy, proponowane rozpoznania i zalecenia. Ty czytasz, poprawiasz
-i zatwierdzasz — ostatnie słowo zawsze należy do Ciebie.
+MindScribe słucha nagrania i przygotowuje szczegółowy, uporządkowany zapis wizyty:
+powód zgłoszenia, aktualne objawy, historię leczenia, osobny opis każdego leku,
+omówione leczenie i zalecenia. Ty czytasz, poprawiasz i zatwierdzasz — ostatnie
+słowo zawsze należy do Ciebie.
 
-**Co wyróżnia tę aplikację:**
+**Jak pracuje:**
 
-- **Myśli samobójcze zawsze na wierzchu.** Każda notatka zaczyna się od jednoznacznej
-  informacji o ryzyku — nie trzeba jej szukać w tekście.
-- **Kody rozpoznań sprawdzane u źródła.** ICD-10 i ICD-11 potwierdzamy w oficjalnym
-  rejestrze WHO, więc kod i jego znaczenie nie mogą się rozjechać. Możesz też pracować
-  na DSM-5.
-- **Uczy się Twojego stylu.** Im więcej notatek zatwierdzisz, tym bardziej kolejne
+- **Szczegółowo, nie lakonicznie.** Odtwarza przebieg wywiadu zamiast skracać go
+  do streszczenia — nie gubi informacji istotnych klinicznie.
+- **Wiernie nagraniu.** Zapisuje tylko to, co padło. Czego nie poruszono, oznacza jako
+  nieporuszone — brak rozmowy o objawie nie staje się jego zaprzeczeniem.
+- **Nie stawia rozpoznań i nie planuje leczenia.** Dokumentuje rozpoznania i zalecenia
+  wyłącznie wtedy, gdy wypowiedział je lekarz.
+- **Pokazuje, co sprawdzić.** Niejasne dawki, sprzeczne informacje i niepewne nazwy
+  leków dostajesz jako listę do weryfikacji przed zatwierdzeniem.
+- **Bezpieczeństwo na wierzchu.** Status myśli samobójczych widać od razu — także wtedy,
+  gdy tematu nie poruszono, bo to też jest informacja.
+- **Uczy się Twojego stylu.** Im więcej dokumentacji zatwierdzisz, tym bardziej kolejne
   przypominają sposób, w jaki piszesz Ty.
-- **Nic nie jest zmyślane.** Gdy nagranie jest nieczytelne, aplikacja powie to wprost,
-  zamiast wypełniać notatkę treścią, której nie było.
 
 Zacznij od **Nowa wizyta** w panelu po lewej.
     """

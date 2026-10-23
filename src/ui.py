@@ -1,107 +1,103 @@
-"""Pomocnicze komponenty UI: ładny widok notatki + przycisk kopiowania do schowka."""
+"""Komponenty UI: widok dokumentacji, ostrzeżenie o ryzyku, przycisk kopiowania."""
 
 import json
-from typing import Any
+import re
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-from .formatting import (
-    audio_quality_label,
-    audio_unusable,
-    group_codes_by_classification,
-    needs_manual_check,
-    risk_is_present,
-    verification_state,
-    visit_type_label,
-)
+from .formatting import NIE_PORUSZONO, PILNE, RYZYKO_OPIS, visit_type_label
+from .schemas import SEKCJE
+
+_TITLES = {title for _, title in SEKCJE}
+
+# Znaki, które markdown Streamlita zamieniłby w formatowanie. Dokumentacja to tekst
+# kliniczny, nie markdown: gwiazdka albo podkreślnik w wypowiedzi pacjenta nie mogą
+# zamienić się w pogrubienie, a „1." na początku linii — w listę z inną numeracją.
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|>~<])")
 
 
-def render_note(note: dict[str, Any], *, visit_type: str | None = None) -> None:
-    """Ładnie wyrenderuj notatkę (nagłówki, pogrubienia, czerwony alert dla ryzyka)."""
+def _escape(text: str) -> str:
+    """Tekst dosłownie, z zachowanymi łamaniami linii."""
+    escaped = _MD_SPECIAL.sub(r"\\\1", text)
+    return "  \n".join(escaped.splitlines())
+
+
+def _split_sections(document: str) -> list[tuple[str | None, str]]:
+    """Podziel dokument na (nagłówek, treść) po nagłówkach sekcji A–Q.
+
+    Lekarz edytuje całość jako jeden tekst, więc mógł zmienić albo usunąć nagłówki.
+    Wtedy nic nie dzielimy — pokazujemy całość jako jeden blok, zamiast zgubić treść.
+    """
+    sections: list[tuple[str | None, list[str]]] = [(None, [])]
+    for line in document.splitlines():
+        if line.strip() in _TITLES:
+            sections.append((line.strip(), []))
+        else:
+            sections[-1][1].append(line)
+    return [(title, "\n".join(body).strip()) for title, body in sections if title or "\n".join(body).strip()]
+
+
+def render_document(document: str) -> None:
+    """Wyświetl dokumentację: nagłówki sekcji, treść dosłownie, nieporuszone przygaszone."""
+    for title, body in _split_sections(document):
+        if title:
+            st.markdown(f"**{_escape(title)}**")
+        if not body:
+            continue
+        if body == NIE_PORUSZONO:
+            # Przygaszone, żeby wzrok przeskakiwał po obszarach, których wizyta nie objęła.
+            st.caption(body)
+            continue
+        if body.startswith(PILNE):
+            st.error(f"**{_escape(PILNE)}**")
+            body = body[len(PILNE):].strip()
+        st.markdown(_escape(body))
+
+
+def render_risk_banner(ryzyko: str | None, *, pilne: bool = False) -> None:
+    """Status ryzyka samobójczego nad dokumentacją — trzy stany, każdy wyraźnie inny."""
+    status = (ryzyko or "NIE_OCENIANO").upper()
+    label = RYZYKO_OPIS.get(status, RYZYKO_OPIS["NIE_OCENIANO"])
+    if pilne:
+        st.error(
+            "🚨 **Fragment oznaczony do PILNEJ weryfikacji** — nagranie może wskazywać na "
+            "aktualne zagrożenie życia lub zdrowia. Sprawdź sekcję J."
+        )
+    if status == "OBECNE":
+        st.error(f"⚠️ **Myśli i zachowania samobójcze: {label}.**")
+    elif status == "ZAPRZECZA":
+        st.success(f"Myśli i zachowania samobójcze: **{label}**.")
+    else:
+        # Nie zielony: brak oceny to nie jest dobra wiadomość, tylko luka w wywiadzie.
+        st.warning(f"Myśli i zachowania samobójcze: **{label}**.")
+
+
+def render_review_items(items: list[str]) -> None:
+    """Kwestie do sprawdzenia przed zatwierdzeniem (punkt 6 promptu klinicznego).
+
+    Stoją NAD dokumentem i do niego nie trafiają — to zadania dla lekarza, nie treść
+    dokumentacji medycznej.
+    """
+    items = [str(i).strip() for i in items if str(i).strip()]
+    if not items:
+        return
+    st.warning(
+        f"**Do sprawdzenia przed zatwierdzeniem ({len(items)})**  \n"
+        + "  \n".join(f"• {_escape(i)}" for i in items)
+    )
+
+
+def visit_caption(visit_type: str | None) -> None:
     if visit_type:
         st.caption(visit_type_label(visit_type))
-
-    # Ostrzeżenie o nagraniu idzie NAD wszystkim — jeśli model nie miał czego słuchać,
-    # lekarz musi to zobaczyć zanim przeczyta jakąkolwiek treść.
-    if warning := audio_quality_label(note):
-        if audio_unusable(note):
-            st.error(f"🔇 **{warning}**")
-        else:
-            st.warning(f"🔉 {warning}")
-
-    opis = (note.get("ryzyko_samobojcze_opis") or "").strip()
-    if risk_is_present(note):
-        st.error(f"⚠️ **MYŚLI SAMOBÓJCZE: OBECNE**{(' — ' + opis) if opis else ''}")
-    else:
-        st.success(f"**Myśli samobójcze: NIEOBECNE**{(' — ' + opis) if opis else ''}")
-
-    if note.get("podsumowanie"):
-        st.markdown("#### Podsumowanie")
-        st.write(note["podsumowanie"])
-
-    if note.get("status_psychiczny"):
-        st.markdown("#### Status psychiczny")
-        st.write(note["status_psychiczny"])
-
-    if note.get("objawy"):
-        st.markdown("#### Objawy")
-        for o in note["objawy"]:
-            st.markdown(f"- {o}")
-
-    if nieobecne := note.get("objawy_nieobecne"):
-        st.markdown("#### Objawy nieobecne")
-        st.caption("Zanegowane przez pacjenta albo takie, które ustąpiły.")
-        for o in nieobecne:
-            st.markdown(f"- {o}")
-
-    if grouped := group_codes_by_classification(note):
-        all_codes = [k for kody in grouped.values() for k in kody]
-        unverified = [k for k in all_codes if needs_manual_check(k)]
-        if unverified:
-            st.warning(
-                f"⚠️ {len(unverified)} z {len(all_codes)} rozpoznań **nie zostało potwierdzonych "
-                "w oficjalnym rejestrze**. Sprawdź je ręcznie przed wpisaniem do dokumentacji."
-            )
-        for system, kody in grouped.items():
-            st.markdown(f"#### Rozpoznania ({system})")
-            for k in kody:
-                mark = {"POTWIERDZONY": "✅", "NIEPOTWIERDZONY": "❓"}.get(
-                    verification_state(k), "•"
-                )
-                code = k.get("code") or "—"
-                conf = k.get("confidence")
-                suffix = f" _(pewność rozpoznania {float(conf):.2f})_" if conf is not None else ""
-                rola = "**główne**" if k.get("rozpoznanie_glowne") else "współistniejące"
-                st.markdown(
-                    f"- {mark} **{code}** — {k.get('description', '')} · {rola}{suffix}"
-                )
-                if oficjalna := (k.get("oficjalna_nazwa") or "").strip():
-                    st.caption(f"　↳ wg rejestru WHO: {oficjalna}")
-                if uwaga := (k.get("uwaga") or "").strip():
-                    st.caption(f"　↳ {uwaga}")
-
-    # Starsze notatki miały jedno pole `zalecenia`.
-    if wlasne := (note.get("zalecenia_terapeuty") or note.get("zalecenia")):
-        st.markdown("#### Zalecenia")
-        for z in wlasne:
-            st.markdown(f"- {z}")
-
-    if leki := note.get("leki"):
-        st.markdown("#### Leki")
-        for lek in leki:
-            st.markdown(f"- {lek}")
-
-    if proponowane := note.get("zalecenia_proponowane"):
-        st.markdown("#### Propozycje do rozważenia")
-        st.caption("Sugestie asystenta — nie padły podczas wizyty.")
-        for z in proponowane:
-            st.markdown(f"- {z}")
 
 
 def copy_button(text: str, *, label: str = "📋 Skopiuj wszystko", key: str = "copy") -> None:
     """Przycisk kopiujący `text` do schowka. Działa w iframe Streamlit (fallback execCommand)."""
-    payload = json.dumps(text)
+    # `json.dumps` nie escapuje „</", a tekst siedzi wewnątrz <script>. Dokumentację
+    # lekarz pisze teraz swobodnie, więc „</script>" w treści zamknąłby skrypt w pół.
+    payload = json.dumps(text).replace("</", "<\\/")
     html = f"""
     <button id="{key}" style="
         background:#1f77b4;color:#fff;border:none;border-radius:6px;
@@ -125,4 +121,22 @@ def copy_button(text: str, *, label: str = "📋 Skopiuj wszystko", key: str = "
     }});
     </script>
     """
-    components.html(html, height=48)
+    _embed_html(html, height=48)
+
+
+def _embed_html(html: str, *, height: int) -> None:
+    """Osadź własny HTML z JavaScriptem.
+
+    `components.v1.html` jest wycofywane — Streamlit zapowiedział jego usunięcie, a
+    `requirements.txt` nie ogranicza wersji od góry, więc świeże wdrożenie może dostać
+    wydanie, w którym go już nie ma. Wtedy cała strona padłaby na przycisku kopiowania.
+    `st.iframe` jest następcą; stara funkcja zostaje tylko dla wersji sprzed niego.
+
+    Ostrzeżenie z dokumentacji `st.iframe` (nie podawać niezaufanego HTML) tu nie
+    dotyczy: szablon jest nasz, a jedyna zmienna treść — dokumentacja — siedzi w nim
+    wyłącznie jako zakodowany literał JSON (patrz `copy_button`).
+    """
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height)
+    else:  # pragma: no cover — starsze wydania Streamlita
+        components.html(html, height=height)

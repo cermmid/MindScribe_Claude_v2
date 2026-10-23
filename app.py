@@ -28,8 +28,8 @@ st.set_page_config(page_title="MindScribe", page_icon="🧠", layout="wide")
 # gdy selektor przestanie trafiać, nic się nie zepsuje, tylko wróci zachowanie domyślne.
 #
 # 1. Streamlit przygasza całą stronę przy każdym przeładowaniu skryptu, a przeładowanie
-#    odpala każde kliknięcie — zaznaczenie klasyfikacji, zmiana pola w tabeli. Miga to
-#    bez przerwy i przy dłuższym wypełnianiu notatki męczy wzrok. Wygaszamy przygaszanie;
+#    odpala każde kliknięcie — zaznaczenie opcji, wyjście z pola tekstowego. Miga to
+#    bez przerwy i przy dłuższej pracy nad dokumentacją męczy wzrok. Wygaszamy przygaszanie;
 #    o tym, że coś się liczy, i tak mówi pasek postępu przy generowaniu.
 # 2. Logo powiększone ponad to, co pozwala `st.logo` — szczegóły przy regule niżej.
 st.markdown(

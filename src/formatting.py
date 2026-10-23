@@ -1,13 +1,38 @@
-"""Renderowanie notatki jako czytelny zwykły tekst (do kopiowania) + pomocnicze nazwy wizyt.
+"""Składanie dokumentacji do postaci tekstu i pomocnicze nazwy wizyt.
 
-Funkcje są tolerancyjne — czytają przez .get() z domyślnymi wartościami, więc działają także
-na starszych zatwierdzonych notatkach sprzed dodania pola ryzyka samobójczego.
+Lekarz poprawia całą dokumentację jako JEDEN tekst. Ten moduł zamienia ustrukturyzowaną
+odpowiedź modelu (`DokumentacjaDraft`) w ten tekst: sekcje A–Q w stałej kolejności,
+każda z nagłówkiem, puste oznaczone jako nieporuszone.
+
+Pusta sekcja dostaje znacznik od APLIKACJI, nie od modelu. Model ma zostawiać nieporuszone
+obszary puste — dzięki temu nie ma pokusy dopisania ogólników w rodzaju „pacjent nie
+zgłasza…", których prompt kliniczny wprost zabrania („Brak danych nie oznacza zaprzeczenia").
 """
 
 from typing import TYPE_CHECKING, Any
 
+from .schemas import SEKCJE
+
 if TYPE_CHECKING:  # pandas jest potrzebny wyłącznie dla tabeli Streamlita (patrz niżej)
     import pandas as pd
+
+
+NIE_PORUSZONO = "Nie poruszono podczas konsultacji."
+
+# Sformułowanie z promptu klinicznego, sekcja J: nie „bez myśli samobójczych", tylko
+# informacja, że obszaru nie oceniano. To rozróżnienie jest powodem istnienia trzeciego stanu.
+J_NIE_OCENIANO = (
+    "Nie odnotowano danych pozwalających ocenić ten obszar — temat nie został poruszony "
+    "podczas konsultacji."
+)
+
+RYZYKO_OPIS = {
+    "OBECNE": "zgłaszane przez pacjenta",
+    "ZAPRZECZA": "pacjent zaprzecza",
+    "NIE_OCENIANO": "nie oceniano podczas konsultacji",
+}
+
+PILNE = "!! FRAGMENT DO PILNEJ WERYFIKACJI PRZEZ LEKARZA"
 
 
 def enum_value(value: Any) -> str:
@@ -41,99 +66,92 @@ def display_name(visit: dict[str, Any]) -> str:
     return name
 
 
-def get_icd_codes(note: dict[str, Any]) -> list[dict[str, Any]]:
-    """Kody rozpoznań, tolerancyjnie wobec notatek sprzed dodania wyboru ICD-11.
-
-    Starsze notatki mają klucz `kody_icd10`, nowe `kody_icd`.
-    """
-    return note.get("kody_icd") or note.get("kody_icd10") or []
-
-
-def classifications_of(note: dict[str, Any]) -> list[str]:
-    """Klasyfikacje użyte w notatce, tolerancyjnie wobec starszych wpisów.
-
-    Notatki sprzed wyboru wielu klasyfikacji mają pojedyncze `klasyfikacja`,
-    a te sprzed dodania ICD-11 nie mają go wcale — wtedy z definicji ICD-10.
-    """
-    many = note.get("klasyfikacje")
-    if isinstance(many, list) and many:
-        return [enum_value(k) for k in many if k]
-    single = note.get("klasyfikacja")
-    return [enum_value(single)] if single else ["ICD-10"]
-
-
-def classification_label(note: dict[str, Any]) -> str:
-    """Czytelna etykieta klasyfikacji, np. „ICD-10" albo „ICD-10 + DSM-5"."""
-    return " + ".join(classifications_of(note))
-
-
-def group_codes_by_classification(note: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Rozpoznania pogrupowane po klasyfikacji, w kolejności z notatki."""
-    codes = get_icd_codes(note)
-    order = classifications_of(note)
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for code in codes:
-        key = enum_value(code.get("klasyfikacja")).strip() or (order[0] if order else "ICD-10")
-        grouped.setdefault(key, []).append(code)
-    # Najpierw klasyfikacje zamówione przez lekarza, potem ewentualne pozostałe.
-    ordered = {k: grouped[k] for k in order if k in grouped}
-    ordered.update({k: v for k, v in grouped.items() if k not in ordered})
-    return ordered
-
-
-def verification_state(code: dict[str, Any]) -> str:
-    """Stan weryfikacji wpisu, tolerancyjnie wobec notatek sprzed trzech stanów.
-
-    Starsze wpisy mają tylko `zweryfikowany` — `True` mapujemy na potwierdzony,
-    `False` na niepotwierdzony, bo wtedy brak potwierdzenia zawsze znaczył próbę.
-    """
-    state = enum_value(code.get("weryfikacja")).upper()
-    if state in {"POTWIERDZONY", "NIESPRAWDZANY", "NIEPOTWIERDZONY"}:
-        return state
-    return "POTWIERDZONY" if code.get("zweryfikowany") else "NIEPOTWIERDZONY"
-
-
-def needs_manual_check(code: dict[str, Any]) -> bool:
-    """Czy wpis wymaga uwagi lekarza — czyli próbowaliśmy i się nie udało."""
-    return verification_state(code) == "NIEPOTWIERDZONY"
-
-
 def audio_unusable(note: dict[str, Any]) -> bool:
     """Czy model zgłosił, że w nagraniu nie było zrozumiałej mowy."""
-    return str(note.get("jakosc_nagrania", "")).upper() == "BRAK_MOWY"
+    return enum_value(note.get("jakosc_nagrania")).upper() == "BRAK_MOWY"
 
 
 def audio_quality_label(note: dict[str, Any]) -> str | None:
-    quality = str(note.get("jakosc_nagrania", "")).upper()
+    quality = enum_value(note.get("jakosc_nagrania")).upper()
     if quality == "BRAK_MOWY":
-        return "W nagraniu nie wykryto zrozumiałej mowy — notatka może być pusta lub niepełna."
+        return "W nagraniu nie wykryto zrozumiałej mowy — dokumentacja jest pusta albo niepełna."
     if quality == "SLABA":
-        return "Nagranie częściowo niezrozumiałe — sprawdź transkrypcję szczególnie uważnie."
+        return "Nagranie częściowo niezrozumiałe — sprawdź dokumentację szczególnie uważnie."
     return None
 
 
-def risk_is_present(note: dict[str, Any]) -> bool:
-    return str(note.get("ryzyko_samobojcze", "")).upper() == "OBECNE"
+def risk_status(draft: dict[str, Any]) -> str:
+    """Status z sekcji J; brak danych traktujemy jako NIE_OCENIANO, nigdy jako zaprzeczenie."""
+    status = enum_value((draft.get("j_bezpieczenstwo") or {}).get("status")).upper()
+    return status if status in RYZYKO_OPIS else "NIE_OCENIANO"
 
 
-def risk_line(note: dict[str, Any]) -> str:
-    present = risk_is_present(note)
-    head = "⚠️ MYŚLI SAMOBÓJCZE: OBECNE" if present else "MYŚLI SAMOBÓJCZE: NIEOBECNE"
-    opis = (note.get("ryzyko_samobojcze_opis") or "").strip()
-    return f"{head} — {opis}" if opis else head
+def risk_is_urgent(draft: dict[str, Any]) -> bool:
+    return bool((draft.get("j_bezpieczenstwo") or {}).get("pilne"))
 
 
-def note_to_text(
-    note: dict[str, Any],
+def _section_body(field: str, draft: dict[str, Any]) -> str:
+    if field == "e_leki":
+        leki = [lek for lek in (draft.get("e_leki") or []) if (lek.get("nazwa") or "").strip()]
+        if not leki:
+            return NIE_PORUSZONO
+        parts = []
+        for i, lek in enumerate(leki, 1):
+            opis = (lek.get("opis") or "").strip()
+            parts.append(f"{i}. {lek['nazwa'].strip()}" + (f"\n{opis}" if opis else ""))
+        return "\n\n".join(parts)
+
+    if field == "j_bezpieczenstwo":
+        j = draft.get("j_bezpieczenstwo") or {}
+        status = risk_status(draft)
+        opis = (j.get("opis") or "").strip()
+        if status == "NIE_OCENIANO" and not opis:
+            body = J_NIE_OCENIANO
+        else:
+            body = f"Myśli i zachowania samobójcze: {RYZYKO_OPIS[status]}."
+            if opis:
+                body += f"\n{opis}"
+        if risk_is_urgent(draft):
+            body = f"{PILNE}\n{body}"
+        return body
+
+    return (draft.get(field) or "").strip() or NIE_PORUSZONO
+
+
+def draft_to_document(draft: dict[str, Any]) -> str:
+    """Ustrukturyzowana odpowiedź modelu → jeden tekst do edycji przez lekarza.
+
+    Zawiera wszystkie sekcje, także nieporuszone. To celowe: lekarz od razu widzi,
+    które obszary wizyta pominęła — to jest kontrola kompletności z punktu 6 promptu,
+    tylko wykonana na oczach lekarza, a nie wyłącznie przez model.
+
+    Lista `do_weryfikacji` NIE trafia do dokumentu. To lista zadań dla lekarza przed
+    zatwierdzeniem, a nie treść dokumentacji medycznej.
+
+    Ostrzeżenie o nagraniu natomiast trafia — i to na sam początek. Przy niemym nagraniu
+    każda sekcja mówi „nie poruszono", a wklejone bez ostrzeżenia czyta się jak wizyta,
+    na której nic nie omówiono. Prawda jest inna: nagranie zawiodło.
+    """
+    blocks = [f"{title}\n{_section_body(field, draft)}" for field, title in SEKCJE]
+    if warning := audio_quality_label(draft):
+        blocks.insert(0, f"!! UWAGA: {warning}")
+    return "\n\n".join(blocks).strip() + "\n"
+
+
+def with_header(
+    document: str,
     *,
     title: str | None = None,
     visit_type: str | None = None,
     created_at: str | None = None,
     doctor_name: str | None = None,
 ) -> str:
-    """Zbuduj pełną, czytelną notatkę tekstową gotową do skopiowania."""
-    lines: list[str] = []
+    """Dokument z nagłówkiem wizyty — to trafia do schowka.
 
+    Nagłówek dokładamy przy kopiowaniu, a nie do pola edycji: data i prowadzący pochodzą
+    z rekordu wizyty i nie powinny dać się przypadkiem nadpisać przy poprawianiu treści.
+    """
+    lines: list[str] = []
     if title:
         lines.append(title)
     meta = []
@@ -141,103 +159,14 @@ def note_to_text(
         meta.append(visit_type_label(visit_type))
     if created_at:
         meta.append(f"Data: {created_at[:10]}")
+    if doctor_name:
+        meta.append(f"Prowadzący: {doctor_name}")
     if meta:
         lines.append(" · ".join(meta))
-    lines.append("=" * 48)
-
-    # Ostrzeżenie o nagraniu — przed treścią, żeby nie dało się go przeoczyć.
-    if warning := audio_quality_label(note):
-        lines.append(f"!! UWAGA: {warning}")
+    if lines:
+        lines.append("=" * 48)
         lines.append("")
-
-    # Ryzyko samobójcze — ZAWSZE na początku.
-    lines.append(risk_line(note))
-    lines.append("")
-
-    podsumowanie = (note.get("podsumowanie") or "").strip()
-    if podsumowanie:
-        lines.append("PODSUMOWANIE")
-        lines.append(podsumowanie)
-        lines.append("")
-
-    status = (note.get("status_psychiczny") or "").strip()
-    if status:
-        lines.append("STATUS PSYCHICZNY")
-        lines.append(status)
-        lines.append("")
-
-    objawy = note.get("objawy") or []
-    if objawy:
-        lines.append("OBJAWY")
-        lines.extend(f"- {o}" for o in objawy)
-        lines.append("")
-
-    # Objaw zanegowany to udokumentowany negatyw — ma wartość kliniczną, ale musi
-    # stać osobno, żeby nikt nie odczytał go jako obecnego.
-    if nieobecne := (note.get("objawy_nieobecne") or []):
-        lines.append("OBJAWY NIEOBECNE (zanegowane lub ustąpiłe)")
-        lines.extend(f"- {o}" for o in nieobecne)
-        lines.append("")
-
-    grouped = group_codes_by_classification(note)
-    if grouped:
-        any_unverified = False
-        for system, kody in grouped.items():
-            lines.append(f"ROZPOZNANIA ({system})")
-            for k in kody:
-                code = (k.get("code") or "").strip()
-                desc = (k.get("description") or "").strip()
-                line = f"- {code}" if code else "- (brak kodu)"
-                if desc:
-                    line += f" — {desc}"
-                # Rozpoznanie zasadnicze musi być widoczne w dokumentacji, a nie
-                # domyślane z kolejności wierszy.
-                line += " [GŁÓWNE]" if k.get("rozpoznanie_glowne") else " [współistniejące]"
-                # Wszystkie trzy stany, nie tylko brak potwierdzenia: „nie sprawdzano"
-                # to inna informacja niż „sprawdzono i potwierdzono".
-                stan = verification_state(k)
-                line += f" [{stan}]"
-                if needs_manual_check(k):
-                    any_unverified = True
-                if conf := k.get("confidence"):
-                    line += f" (pewność {float(conf):.2f})"
-                lines.append(line)
-                # Oficjalne brzmienie z rejestru ujawnia rozjazd kodu ze znaczeniem —
-                # to ono wyszło przy QE80 opisanym jako zaburzenia snu.
-                if oficjalna := (k.get("oficjalna_nazwa") or "").strip():
-                    lines.append(f"    wg rejestru WHO: {oficjalna}")
-            lines.append("")
-        if any_unverified:
-            lines.append(
-                "Pozycje [NIEPOTWIERDZONY] nie zostały potwierdzone w oficjalnym rejestrze. "
-                "[NIESPRAWDZANY] oznacza klasyfikację, której nie odpytujemy."
-            )
-            lines.append("")
-
-    # Starsze notatki miały jedno pole `zalecenia` — traktujemy je jako zalecenia specjalisty.
-    wlasne = note.get("zalecenia_terapeuty") or note.get("zalecenia") or []
-    if wlasne:
-        lines.append("ZALECENIA")
-        lines.extend(f"- {z}" for z in wlasne)
-        lines.append("")
-
-    # Leki idą tuż po zaleceniach specjalisty i PRZED propozycjami asystenta — to
-    # ordynacja, a nie sugestia, i nie może sąsiadować z tym, co wymyślił asystent.
-    if leki := (note.get("leki") or []):
-        lines.append("LEKI")
-        lines.extend(f"- {lek}" for lek in leki)
-        lines.append("")
-
-    proponowane = note.get("zalecenia_proponowane") or []
-    if proponowane:
-        lines.append("PROPOZYCJE DO ROZWAŻENIA (od asystenta, nie padły na wizycie)")
-        lines.extend(f"- {z}" for z in proponowane)
-        lines.append("")
-
-    if doctor_name:
-        lines.append(f"Prowadzący: {doctor_name}")
-
-    return "\n".join(lines).strip() + "\n"
+    return "\n".join(lines) + (document or "").strip() + "\n"
 
 
 # Polskie nazwy kolumn dla widoku Historii. Kolejność = porządek kluczy w słowniku.
@@ -257,8 +186,7 @@ def humanize_visits_df(visits: list[dict[str, Any]]) -> "pd.DataFrame":
     """Tabela wizyt z polskimi nagłówkami, w ustalonej kolejności.
 
     Jedyna funkcja w tym module wymagająca pandas — importujemy go tutaj, żeby
-    reszta (formatowanie notatki, zgodność ze starymi wpisami) działała także
-    w backendzie bez pandas. Ta funkcja i tak znika przy przejściu na PWA.
+    reszta działała także w backendzie bez pandas.
     """
     import pandas as pd
 

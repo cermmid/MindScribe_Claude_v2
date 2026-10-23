@@ -1,30 +1,32 @@
-import pandas as pd
 import streamlit as st
 
 from src.audio import looks_silent
-from src.db import DatabaseUnavailable, get_visit
 from src.auth import current_doctor, current_user_id
+from src.db import DatabaseUnavailable, get_visit
 from src.formatting import (
+    RYZYKO_OPIS,
     audio_quality_label,
     audio_unusable,
-    get_icd_codes,
-    needs_manual_check,
-    note_to_text,
-    verification_state,
+    risk_is_urgent,
+    risk_status,
+    with_header,
 )
 from src.services import (
     DEFAULT_AUDIO_SUFFIX,
     VisitNotUpdated,
-    approve_note,
-    build_corrected_note,
-    count_distinct_diagnoses,
+    approve_documentation,
+    build_approved_documentation,
     create_visit_from_audio,
     derive_audio_suffix,
     load_few_shot_examples,
-    registry_is_configured,
-    split_lines,
 )
-from src.ui import copy_button, render_note
+from src.ui import (
+    copy_button,
+    render_document,
+    render_review_items,
+    render_risk_banner,
+    visit_caption,
+)
 
 st.title("🎙️ Nowa wizyta")
 
@@ -32,32 +34,13 @@ st.title("🎙️ Nowa wizyta")
 st.header("1. Dane wizyty")
 visit_label = st.text_input(
     "Etykieta wizyty (opcjonalnie)",
-    placeholder="np. pacjent A — lęki",
+    placeholder="np. pacjent A — kontrola leczenia",
     help=(
         "NIE wpisuj imienia, nazwiska ani żadnych danych, które umożliwią identyfikację "
         "pacjenta przez osoby trzecie. Używaj pseudonimu lub krótkiego opisu."
     ),
 )
 visit_type = st.radio("Typ wizyty", ["Pierwsza", "Kolejna"], horizontal=True)
-st.markdown("**Klasyfikacje rozpoznań** — zaznacz jedną albo kilka naraz")
-_systems = ["ICD-10", "ICD-11", "DSM-5"]
-_cols = st.columns(len(_systems))
-klasyfikacje = [
-    system
-    for system, col in zip(_systems, _cols)
-    if col.checkbox(system, value=(system == "ICD-10"), key=f"kl_{system}")
-]
-if not klasyfikacje:
-    st.warning("Zaznacz przynajmniej jedną klasyfikację — użyję ICD-10.")
-    klasyfikacje = ["ICD-10"]
-if len(klasyfikacje) > 1:
-    st.caption("To samo rozpoznanie dostanie kod w każdym z zaznaczonych systemów.")
-if "DSM-5" in klasyfikacje:
-    st.caption(
-        "ℹ️ DSM-5 wydaje Amerykańskie Towarzystwo Psychiatryczne i **nie ma publicznego "
-        "rejestru**, więc jego rozpoznań nie potwierdzamy automatycznie — zostaną oznaczone "
-        "do weryfikacji. W rejestrze WHO sprawdzamy ICD-11."
-    )
 
 # --- 2. Wejście audio ----------------------------------------------------------
 st.header("2. Wejście audio")
@@ -83,11 +66,11 @@ elif uploaded is not None:
     audio_mime = getattr(uploaded, "type", None)
     audio_suffix = derive_audio_suffix(uploaded.name)
 
-# --- 3. Generacja notatki ------------------------------------------------------
-st.header("3. Generacja notatki")
+# --- 3. Generowanie dokumentacji -----------------------------------------------
+st.header("3. Generowanie dokumentacji")
 
 # Cisza w nagraniu = model nie ma czego transkrybować. Sprawdzamy PRZED wysyłką,
-# żeby nie płacić za pustą notatkę i żeby lekarz od razu wiedział, że to mikrofon.
+# żeby nie płacić za pustą dokumentację i żeby lekarz od razu wiedział, że to mikrofon.
 _silent = audio_bytes is not None and looks_silent(audio_bytes, audio_mime)
 _force = False
 if _silent:
@@ -105,7 +88,7 @@ if _silent:
     _force = st.checkbox("Wyślij mimo to (jeśli uważasz, że nagranie jest dobre)")
 
 if st.button(
-    "🪄 Wygeneruj notatkę",
+    "🪄 Przygotuj dokumentację",
     type="primary",
     disabled=audio_bytes is None or (_silent and not _force),
 ):
@@ -114,12 +97,14 @@ if st.button(
     except DatabaseUnavailable as exc:
         st.error(str(exc))
         st.stop()
-    _spinner_text = "Słucham nagrania i przygotowuję notatkę… to chwilę potrwa."
+    # Szczegółowa dokumentacja jest kilka razy dłuższa niż dawna notatka — lepiej
+    # uprzedzić, niż zostawić lekarza z wrażeniem, że aplikacja się zawiesiła.
+    _spinner_text = (
+        "Słucham nagrania i przygotowuję szczegółową dokumentację… "
+        "przy dłuższej wizycie to potrwa kilka minut."
+    )
     if few_shot:
-        _spinner_text = (
-            f"Słucham nagrania i przygotowuję notatkę w Twoim stylu "
-            f"(na podstawie {len(few_shot)} wcześniej zatwierdzonych)…"
-        )
+        _spinner_text += f" Styl na podstawie {len(few_shot)} wcześniej zatwierdzonych."
     with st.spinner(_spinner_text):
         try:
             created = create_visit_from_audio(
@@ -131,7 +116,6 @@ if st.button(
                 doctor_id=current_user_id(),
                 doctor_name=current_doctor(),
                 few_shot=few_shot,
-                klasyfikacje=klasyfikacje,
             )
         except DatabaseUnavailable as exc:
             st.error(str(exc))
@@ -140,12 +124,17 @@ if st.button(
             st.error(f"Błąd wywołania Gemini: {e}")
             st.stop()
 
+    # Nowa wizyta wypiera poprzednią zatwierdzoną z widoku — inaczej pod spodem wisiałaby
+    # cudza dokumentacja i łatwo byłoby skopiować nie tę.
+    for key in ("approved_doc", "approved_visit_id", "approved_visit_created_at", "approved_visit_type"):
+        st.session_state.pop(key, None)
     st.session_state["current_visit_id"] = created.visit_id
-    st.session_state["current_note"] = created.note.model_dump()
+    st.session_state["current_draft"] = created.draft.model_dump(mode="json")
+    st.session_state["current_document"] = created.document
+    st.session_state["current_visit_type"] = visit_type
     st.session_state["debug_prompt"] = created.debug_prompt
-    st.session_state["current_usage"] = created.usage
     st.success(
-        f"Wizyta #{created.visit_id} zapisana jako draft. "
+        f"Wizyta #{created.visit_id} zapisana jako szkic. "
         f"Gotowe w {created.timings.calosc:.0f} s."
     )
     # Rozbicie, a nie sama suma: gdy znów zrobi się wolno, od razu widać, który
@@ -155,288 +144,126 @@ if st.button(
 # Zużycie tokenów i koszt są dalej zapisywane do bazy, ale świadomie NIE pokazywane
 # lekarzowi — to dane biznesowe właściciela, widoczne w osobnym panelu (admin/app.py).
 
-# --- 4. HITL: edycja -----------------------------------------------------------
-if "current_note" in st.session_state:
-    st.header("4. Edycja")
-    note_data = st.session_state["current_note"]
+# --- 4. Weryfikacja i edycja ----------------------------------------------------
+if "current_draft" in st.session_state:
+    st.header("4. Weryfikacja i edycja")
+    draft = st.session_state["current_draft"]
+    visit_id = st.session_state["current_visit_id"]
 
     # Jeśli model nie miał czego słuchać, lekarz musi to zobaczyć PRZED czytaniem treści.
-    if audio_unusable(note_data):
+    if audio_unusable(draft):
         st.error(
             "🔇 **W nagraniu nie wykryto zrozumiałej mowy.** "
-            "Notatka poniżej jest pusta albo szczątkowa — to poprawne zachowanie, "
-            "model ma zakaz zmyślania treści. Sprawdź mikrofon i nagraj wizytę ponownie."
+            "Dokumentacja poniżej jest pusta — to poprawne zachowanie, model ma zakaz "
+            "tworzenia treści, której nie słyszał. Sprawdź mikrofon i nagraj wizytę ponownie."
         )
-    elif warning := audio_quality_label(note_data):
+    elif warning := audio_quality_label(draft):
         st.warning(f"🔉 {warning}")
 
-    _transcript = (note_data.get("raw_transcript") or "").strip()
-    if not _transcript and not audio_unusable(note_data):
+    _transcript = (draft.get("raw_transcript") or "").strip()
+    if not _transcript and not audio_unusable(draft):
         st.warning(
             "Transkrypcja jest pusta, choć model nie zgłosił problemu z nagraniem. "
-            "Zweryfikuj nagranie przed zatwierdzeniem notatki."
+            "Zweryfikuj nagranie przed zatwierdzeniem dokumentacji."
         )
 
-    with st.expander("📄 Surowa transkrypcja", expanded=False):
-        raw = st.text_area(
+    _pilne = risk_is_urgent(draft)
+    render_risk_banner(risk_status(draft), pilne=_pilne)
+
+    # Punkt 6 promptu: istotne niejasności lekarz ma zobaczyć PRZED zatwierdzeniem.
+    render_review_items(draft.get("do_weryfikacji") or [])
+
+    with st.expander("📄 Transkrypcja nagrania (do porównania)", expanded=False):
+        st.text_area(
             "Transkrypcja",
-            value=note_data.get("raw_transcript", ""),
-            height=200,
+            value=_transcript,
+            height=300,
+            disabled=True,
             label_visibility="collapsed",
         )
 
-    st.markdown("**🛑 Myśli samobójcze** (pole krytyczne)")
-    _risk_options = ["OBECNE", "NIEOBECNE"]
-    _risk_default = note_data.get("ryzyko_samobojcze", "NIEOBECNE")
+    # Klucz związany z wizytą: nowe generowanie musi dać świeży tekst, a nie zostawić
+    # w polu poprawki wniesione do poprzedniej wizyty.
+    document = st.text_area(
+        "Dokumentacja — popraw dowolny fragment przed zatwierdzeniem",
+        value=st.session_state["current_document"],
+        height=720,
+        key=f"document_{visit_id}",
+    )
+
+    # Jedyny element poza tekstem. Status ryzyka jest w treści sekcji J, ale lekarz mógł
+    # ją przeredagować — tu potwierdza go jawnie, bo aplikacja używa go do ostrzeżeń.
+    _statuses = list(RYZYKO_OPIS)
+    _default = risk_status(draft)
     ryzyko = st.radio(
-        "Ryzyko samobójcze",
-        _risk_options,
-        index=_risk_options.index(_risk_default) if _risk_default in _risk_options else 1,
+        "🛑 Myśli i zachowania samobójcze — potwierdź",
+        _statuses,
+        index=_statuses.index(_default),
+        format_func=lambda s: RYZYKO_OPIS[s],
         horizontal=True,
-        label_visibility="collapsed",
-    )
-    ryzyko_opis = st.text_input(
-        "Opis / uzasadnienie ryzyka",
-        value=note_data.get("ryzyko_samobojcze_opis", ""),
-    )
-    if ryzyko == "OBECNE":
-        st.error("⚠️ Pacjent z myślami samobójczymi — wymaga szczególnej uwagi klinicznej.")
-
-    status_psychiczny = st.text_area(
-        "Status psychiczny",
-        value=note_data.get("status_psychiczny", ""),
-        height=120,
+        key=f"ryzyko_{visit_id}",
     )
 
-    objawy_text = st.text_area(
-        "Objawy (jeden w linii)",
-        value="\n".join(note_data.get("objawy", [])),
-        height=120,
-        help="Wyłącznie objawy obecne u pacjenta teraz.",
-    )
-
-    objawy_nieobecne_text = st.text_area(
-        "Objawy nieobecne (jeden w linii)",
-        value="\n".join(note_data.get("objawy_nieobecne") or []),
-        height=100,
-        help=(
-            "Objawy, którym pacjent zaprzeczył, oraz takie, które ustąpiły — "
-            "na przykład: myśli rezygnacyjne - neguje. Udokumentowany negatyw "
-            "ma wartość kliniczną, dlatego jest osobną rubryką, a nie brakiem wpisu."
-        ),
-    )
-
-    st.markdown(f"**Proponowane rozpoznania — {' + '.join(klasyfikacje)}**")
-    _codes = get_icd_codes(note_data)
-    _unverified = [k for k in _codes if needs_manual_check(k)]
-    if _unverified:
-        st.warning(
-            f"⚠️ {len(_unverified)} z {len(_codes)} rozpoznań **nie zostało potwierdzonych "
-            "w oficjalnym rejestrze** — sprawdź je ręcznie."
-        )
-    # Bez poświadczeń rejestr nie odpowie na nic, więc ICD-11 wraca bez kodu. To nie
-    # jest wtedy błąd rozpoznania, tylko brak konfiguracji — i musi być tak nazwane.
-    if "ICD-11" in klasyfikacje and not registry_is_configured():
-        st.error(
-            "🔌 **Rejestr WHO nie jest skonfigurowany** — brak `ICD_CLIENT_ID` "
-            "i `ICD_CLIENT_SECRET` w sekretach aplikacji. Kody ICD-11 nie zostaną "
-            "dobrane ani sprawdzone; uzupełnij je ręcznie w tabeli poniżej."
+    _confirmed_urgent = True
+    if _pilne:
+        _confirmed_urgent = st.checkbox(
+            "Zweryfikowałem/am fragment oznaczony jako pilny.",
+            key=f"pilne_{visit_id}",
         )
 
-    # Reguła promptu jest mechanizmem, to jest siatka bezpieczeństwa. Nie ucinamy
-    # nadmiarowych rozpoznań w kodzie — ciche wyrzucenie treści medycznej byłoby
-    # gorsze niż pokazanie jej specjaliście do usunięcia.
-    _distinct = count_distinct_diagnoses(_codes)
-    if _distinct > 2:
-        st.warning(
-            f"⚠️ Asystent zaproponował **{_distinct} różne rozpoznania**. Notatka ma zawierać "
-            "jedno rozpoznanie główne i najwyżej jedno towarzyszące — usuń zbędne wiersze."
-        )
-
-    _default_system = klasyfikacje[0]
-    icd_df = pd.DataFrame(
-        [
-            {
-                "klasyfikacja": k.get("klasyfikacja") or _default_system,
-                "code": k.get("code", ""),
-                "description": k.get("description", ""),
-                # Termin angielski jedzie przez edytor, bo to nim odpytujemy rejestr
-                # przy zatwierdzaniu. Zgubiony tutaj = brak potwierdzenia ICD-11.
-                "termin_wyszukiwania": k.get("termin_wyszukiwania", ""),
-                "rozpoznanie_glowne": bool(k.get("rozpoznanie_glowne")),
-                "confidence": k.get("confidence", 0.0),
-                "weryfikacja": verification_state(k),
-                "uwaga": (k.get("uwaga") or "").strip(),
-            }
-            for k in _codes
-        ]
-        or [
-            {
-                "klasyfikacja": _default_system,
-                "code": "",
-                "description": "",
-                "termin_wyszukiwania": "",
-                "rozpoznanie_glowne": True,
-                "confidence": 0.0,
-                "weryfikacja": "NIESPRAWDZANY",
-                "uwaga": "",
-            }
-        ]
-    )
-    edited_icd = st.data_editor(
-        icd_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "klasyfikacja": st.column_config.SelectboxColumn(
-                "System", options=["ICD-10", "ICD-11", "DSM-5"], required=True
-            ),
-            "code": st.column_config.TextColumn(
-                "Kod",
-                help=(
-                    "Kod rozpoznania. Przy ICD-11 aplikacja próbuje go potwierdzić w rejestrze "
-                    "WHO, ale gdy rejestr nie odpowie, zostaje to, co jest tutaj — pustego "
-                    "pola nikt nie uzupełni."
-                ),
-            ),
-            "description": st.column_config.TextColumn("Rozpoznanie", required=True),
-            "termin_wyszukiwania": st.column_config.TextColumn(
-                "Termin ang. (rejestr WHO)",
-                help=(
-                    "Nazwa rozpoznania po angielsku — tym szukamy w rejestrze WHO, bo polskich "
-                    "nazw nie zna. Popraw ją, jeśli kod ICD-11 nie chce się potwierdzić."
-                ),
-            ),
-            "rozpoznanie_glowne": st.column_config.CheckboxColumn(
-                "Główne",
-                help=(
-                    "Rozpoznanie zasadnicze — to, które najlepiej tłumaczy obraz kliniczny. "
-                    "Dokładnie jedno w każdej klasyfikacji; jeśli zaznaczysz kilka, "
-                    "zostanie pierwsze."
-                ),
-            ),
-            "confidence": st.column_config.NumberColumn(
-                "Pewność", min_value=0.0, max_value=1.0, step=0.05, format="%.2f"
-            ),
-            "weryfikacja": st.column_config.TextColumn(
-                "Rejestr WHO",
-                help=(
-                    "POTWIERDZONY — sprawdzony w rejestrze. NIESPRAWDZANY — ICD-10 i DSM-5 "
-                    "przyjmujemy bez odpytywania. NIEPOTWIERDZONY — sprawdzaliśmy i nie ma."
-                ),
-                disabled=True,
-            ),
-            "uwaga": st.column_config.TextColumn(
-                "Dlaczego",
-                help="Co dokładnie powiedział rejestr WHO o tym wpisie.",
-                disabled=True,
-                width="large",
-            ),
-        },
-        key="icd_editor",
-    )
-    st.caption("Po zatwierdzeniu kody ICD są ponownie sprawdzane w rejestrze WHO.")
-
-    zalecenia_text = st.text_area(
-        "Zalecenia (jedno w linii)",
-        value="\n".join(note_data.get("zalecenia_terapeuty") or note_data.get("zalecenia") or []),
-        height=120,
-        help="To, co faktycznie zaleciłaś/zaleciłeś podczas wizyty.",
-    )
-
-    leki_text = st.text_area(
-        "Leki (jeden w linii)",
-        value="\n".join(note_data.get("leki") or []),
-        height=100,
-        help=(
-            "Nazwa, dawka i sposób przyjmowania, na przykład: sertralina 50 mg rano. "
-            "Asystent wpisuje tu wyłącznie to, co padło na wizycie — sam niczego nie proponuje. "
-            "Puste pole znaczy, że leków nie omawiano."
-        ),
-    )
-
-    propozycje_text = st.text_area(
-        "Propozycje do rozważenia (jedna w linii)",
-        value="\n".join(note_data.get("zalecenia_proponowane") or []),
-        height=100,
-        help=(
-            "Sugestie asystenta, których nie było na wizycie. Przenieś do pola wyżej to, "
-            "co przyjmujesz, a resztę usuń."
-        ),
-    )
-
-    podsumowanie = st.text_area(
-        "Podsumowanie",
-        value=note_data.get("podsumowanie", ""),
-        height=100,
-    )
-
-    if st.button("✅ Zatwierdź i zapisz", type="primary"):
+    if st.button("✅ Zatwierdź i zapisz", type="primary", disabled=not _confirmed_urgent):
         try:
-            corrected = build_corrected_note(
-                raw_transcript=raw,
-                ryzyko_samobojcze=ryzyko,
-                ryzyko_samobojcze_opis=ryzyko_opis,
-                status_psychiczny=status_psychiczny,
-                objawy=split_lines(objawy_text),
-                objawy_nieobecne=split_lines(objawy_nieobecne_text),
-                kody_icd=edited_icd.to_dict("records"),
-                zalecenia_terapeuty=split_lines(zalecenia_text),
-                zalecenia_proponowane=split_lines(propozycje_text),
-                leki=split_lines(leki_text),
-                podsumowanie=podsumowanie,
-                klasyfikacje=klasyfikacje,
-                jakosc_nagrania=note_data.get("jakosc_nagrania", "DOBRA"),
-                # Wyniki z generowania — niezmienione wiersze nie muszą jeszcze raz
-                # jechać do rejestru WHO.
-                already_verified=get_icd_codes(note_data),
+            approved = build_approved_documentation(
+                dokument=document,
+                ryzyko=ryzyko,
+                jakosc_nagrania=draft.get("jakosc_nagrania") or "DOBRA",
             )
         except Exception as e:
-            st.error(f"Notatka nie przeszła walidacji: {e}")
+            st.error(f"Dokumentacja nie przeszła walidacji: {e}")
             st.stop()
 
         try:
-            approve_note(
-                st.session_state["current_visit_id"], corrected, doctor_id=current_user_id()
-            )
+            approve_documentation(visit_id, approved, doctor_id=current_user_id())
         except VisitNotUpdated as e:
             # Zapis nie doszedł do skutku — lepiej powiedzieć to wprost, niż pokazać
-            # „zatwierdzono" i pozwolić zamknąć kartę z niezapisaną notatką.
-            st.error(f"Notatka NIE została zapisana. {e}")
+            # „zatwierdzono" i pozwolić zamknąć kartę z niezapisaną dokumentacją.
+            st.error(f"Dokumentacja NIE została zapisana. {e}")
             st.stop()
 
-        st.session_state["approved_note"] = corrected.model_dump()
-        st.session_state["approved_visit_id"] = st.session_state["current_visit_id"]
+        st.session_state["approved_doc"] = approved.model_dump(mode="json")
+        st.session_state["approved_visit_id"] = visit_id
         # Data z rekordu wizyty, nie z zegara: nagranie bywa wgrywane później niż
         # odbyta wizyta, więc „dzisiaj" bywa nieprawdą w dokumentacji.
-        _record = get_visit(st.session_state["current_visit_id"], doctor_id=current_user_id())
+        _record = get_visit(visit_id, doctor_id=current_user_id())
         st.session_state["approved_visit_created_at"] = (_record or {}).get("created_at")
-        st.session_state["approved_visit_type"] = visit_type
+        st.session_state["approved_visit_type"] = st.session_state.get("current_visit_type")
         st.success(
-            f"Wizyta #{st.session_state['current_visit_id']} zatwierdzona. "
-            "Ta notatka zasili few-shot dla przyszłych generacji."
+            f"Wizyta #{visit_id} zatwierdzona. Ta dokumentacja posłuży jako wzorzec stylu "
+            "przy kolejnych wizytach."
         )
-        for key in ("current_note", "current_visit_id", "debug_prompt", "current_usage"):
+        for key in ("current_draft", "current_document", "current_visit_id", "debug_prompt"):
             st.session_state.pop(key, None)
 
     if "debug_prompt" in st.session_state:
         with st.expander("🐛 Debug: prompt wysłany do Gemini", expanded=False):
             st.code(st.session_state["debug_prompt"], language="markdown")
 
-# --- 5. Zatwierdzona notatka do skopiowania -----------------------------------
-if "approved_note" in st.session_state:
-    st.header("5. Gotowa notatka")
-    approved = st.session_state["approved_note"]
+# --- 5. Zatwierdzona dokumentacja do skopiowania -------------------------------
+if "approved_doc" in st.session_state:
+    st.header("5. Gotowa dokumentacja")
+    approved = st.session_state["approved_doc"]
     a_type = st.session_state.get("approved_visit_type")
-    render_note(approved, visit_type=a_type)
+    visit_caption(a_type)
+    render_risk_banner(approved.get("ryzyko"))
+    render_document(approved["dokument"])
 
-    note_text = note_to_text(
-        approved,
+    full_text = with_header(
+        approved["dokument"],
         title=f"Wizyta #{st.session_state.get('approved_visit_id', '')}",
         visit_type=a_type,
         created_at=st.session_state.get("approved_visit_created_at"),
         doctor_name=current_doctor(),
     )
-    copy_button(note_text, key="copy_new")
     with st.expander("📄 Pełny tekst (zaznacz i skopiuj ręcznie)", expanded=False):
-        st.text(note_text)
+        st.text(full_text)
+    copy_button(full_text, key="copy_new")

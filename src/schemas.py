@@ -1,17 +1,21 @@
+"""Kształt dokumentacji z konsultacji — odpowiedź modelu i wersja zatwierdzona.
+
+Dwa modele, celowo rozdzielone:
+
+- `DokumentacjaDraft` to `response_schema` dla Gemini. Sekcje A–Q odpowiadają punktowi 3
+  promptu klinicznego (`prompts/dokumentacja.md`). Opisy pól są częścią polecenia dla
+  modelu, nie dokumentacją kodu — model czyta je przy generowaniu.
+- `ZatwierdzonaDokumentacja` to to, co lekarz zatwierdził: jeden tekst, który sam
+  poprawił, plus potwierdzony przez niego status ryzyka samobójczego.
+
+**Kolejność pól ma znaczenie.** Gemini generuje pola w kolejności schematu. Transkrypcja
+jest pierwsza, więc model pisze sekcje, mając ją już przed sobą. `do_weryfikacji` jest
+ostatnia, więc powstaje po napisaniu całości — to jest kontrola kompletności z punktu 6.
+"""
+
 from enum import Enum
 
 from pydantic import BaseModel, Field
-
-
-class RyzykoSamobojcze(str, Enum):
-    OBECNE = "OBECNE"
-    NIEOBECNE = "NIEOBECNE"
-
-
-class Klasyfikacja(str, Enum):
-    ICD_10 = "ICD-10"
-    ICD_11 = "ICD-11"
-    DSM_5 = "DSM-5"
 
 
 class JakoscNagrania(str, Enum):
@@ -20,187 +24,159 @@ class JakoscNagrania(str, Enum):
     BRAK_MOWY = "BRAK_MOWY"
 
 
-class ICDCode(BaseModel):
-    """Propozycja rozpoznania od modelu — jeszcze niezweryfikowana."""
+class Ryzyko(str, Enum):
+    """Trzy stany, nie dwa.
 
-    klasyfikacja: Klasyfikacja = Field(
-        description=(
-            "Klasyfikacja, do której należy TEN wpis. Gdy poproszono o kilka klasyfikacji, "
-            "podaj to samo rozpoznanie osobnym wpisem dla każdej z nich."
-        )
-    )
-    code: str = Field(
-        default="",
-        description=(
-            "Kod rozpoznania, np. F41.1 dla ICD-10 albo 6B00 dla ICD-11. "
-            "Czy wolno zostawić puste, mówi polecenie — zależy to od klasyfikacji: "
-            "dla części z nich aplikacja ustala kod sama, dla pozostałych musi przyjść od Ciebie."
-        ),
-    )
-    description: str = Field(
-        description=(
-            "Pełna nazwa rozpoznania **PO POLSKU** — wypełnij ZAWSZE, także dla DSM-5. "
-            "Jeśli oryginalna nazwa jest angielska, przetłumacz ją na polski."
-        )
-    )
-    termin_wyszukiwania: str = Field(
-        default="",
-        description=(
-            "Ta sama nazwa rozpoznania **PO ANGIELSKU**, w brzmieniu używanym przez WHO "
-            "(np. Generalised anxiety disorder). Służy wyłącznie do odpytania rejestru — "
-            "rejestr WHO nie ma polskich tłumaczeń, więc bez tego pola nie znajdziemy kodu."
-        ),
-    )
-    rozpoznanie_glowne: bool = Field(
-        default=False,
-        description=(
-            "Czy to jest rozpoznanie GŁÓWNE — to, które najlepiej tłumaczy obraz kliniczny. "
-            "Dokładnie JEDEN wpis w każdej klasyfikacji ma mieć tu true; rozpoznanie "
-            "towarzyszące ma false. Gdy podajesz to samo rozpoznanie w kilku klasyfikacjach, "
-            "oznacz je jako główne w każdej z nich."
-        ),
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0, description="Twoja pewność co do samego ROZPOZNANIA (nie kodu), 0.0-1.0"
-    )
-
-
-class StanWeryfikacji(str, Enum):
-    """Trzy stany, nie dwa — „nie sprawdzano" to co innego niż „sprawdzono i nie ma"."""
-
-    POTWIERDZONY = "POTWIERDZONY"
-    NIESPRAWDZANY = "NIESPRAWDZANY"
-    NIEPOTWIERDZONY = "NIEPOTWIERDZONY"
-
-
-class VerifiedICDCode(BaseModel):
-    """Rozpoznanie po sprawdzeniu w rejestrze WHO.
-
-    Pola weryfikacyjne wypełnia wyłącznie aplikacja — model nie ma do nich dostępu,
-    bo jest osobny schemat wejściowy (`ICDCode`). To celowe: model nie może oświadczyć,
-    że jego własna propozycja została potwierdzona.
+    Pierwsza wersja aplikacji miała tu OBECNE/NIEOBECNE i kazała wpisać NIEOBECNE,
+    gdy temat nie padł albo nagranie było niezrozumiałe. W dokumentacji brak rozmowy
+    o ryzyku wyglądał wtedy dokładnie jak jego zaprzeczenie. Prompt kliniczny wprost
+    tego zabrania: „Nie zapisuj »bez myśli samobójczych«, jeżeli temat nie został
+    poruszony".
     """
 
-    klasyfikacja: str = ""
-    code: str = ""
-    description: str = ""
-    # Angielski termin, którym odpytujemy rejestr. Musi przetrwać weryfikację, inaczej
-    # przy zatwierdzaniu (gdzie sprawdzamy wszystko jeszcze raz) nie mamy już czym
-    # szukać i lecimy polską nazwą, której rejestr WHO nie zna.
-    termin_wyszukiwania: str = ""
-    # Rola rozpoznania. Jawne pole, a nie „pierwsze na liście": specjalista edytuje
-    # wiersze w tabeli, więc kolejność nie jest niczym chroniona.
-    rozpoznanie_glowne: bool = False
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    # Oficjalny tytuł z rejestru (po angielsku). Trzymamy go OBOK polskiej nazwy,
-    # zamiast nią podmieniać: lekarz czyta po polsku, ale rozjazd znaczenia zostaje
-    # widoczny — to właśnie on wyszedł przy QE80 opisanym jako zaburzenia snu.
-    oficjalna_nazwa: str = ""
-    weryfikacja: StanWeryfikacji = StanWeryfikacji.NIESPRAWDZANY
-    # Zachowane dla notatek zapisanych przed wprowadzeniem trzech stanów.
-    zweryfikowany: bool = False
-    propozycja_ai: str = Field(
-        default="", description="Pierwotna nazwa od modelu, gdy różni się od oficjalnej."
+    OBECNE = "OBECNE"
+    ZAPRZECZA = "ZAPRZECZA"
+    NIE_OCENIANO = "NIE_OCENIANO"
+
+
+class Lek(BaseModel):
+    nazwa: str = Field(
+        description=(
+            "Nazwa leku w takim brzmieniu, w jakim padła. Gdy pacjent nie jest pewien nazwy, "
+            "dopisz to wprost, na przykład: sertralina (nazwa niepewna)."
+        )
     )
-    uwaga: str = ""
+    opis: str = Field(
+        description=(
+            "Szczegółowy opis tego leku według punktów 1–16 sekcji E, w zakresie, w jakim "
+            "padły w rozmowie: dawki i ich zmiany, okres przyjmowania, powód, efekt, "
+            "działania niepożądane, przyczyna i sposób odstawienia, przerwy, powrót. "
+            "Pomiń punkty, o których nie rozmawiano — nie wypełniaj ich ogólnikami."
+        )
+    )
 
 
-class _NoteBase(BaseModel):
+class Bezpieczenstwo(BaseModel):
+    status: Ryzyko = Field(
+        description=(
+            "OBECNE — pacjent zgłasza myśli, zamiary, plany lub zachowania samobójcze albo "
+            "samouszkodzenia (także pośrednio). ZAPRZECZA — temat został poruszony i pacjent "
+            "zaprzecza. NIE_OCENIANO — temat nie został poruszony albo nagranie nie pozwala "
+            "go ocenić. Nigdy nie wybieraj ZAPRZECZA, jeśli o to nie pytano."
+        )
+    )
+    opis: str = Field(
+        default="",
+        description=(
+            "Treść sekcji J: precyzyjnie, bez eufemizmów i bez bagatelizowania. Pusta, gdy "
+            "temat nie został poruszony."
+        ),
+    )
+    pilne: bool = Field(
+        default=False,
+        description=(
+            "true, gdy nagranie wskazuje na aktualne zagrożenie życia lub zdrowia i fragment "
+            "wymaga pilnej weryfikacji przez lekarza."
+        ),
+    )
+
+
+# Jedno źródło prawdy o sekcjach: pole schematu → nagłówek w dokumencie. Używają go
+# zarówno opisy pól poniżej, jak i składanie tekstu do edycji (`src/formatting.py`).
+# Sekcje E (leki) i J (bezpieczeństwo) mają własną strukturę i są obsługiwane osobno.
+SEKCJE: list[tuple[str, str]] = [
+    ("a_dane_ogolne", "A. Dane ogólne i sytuacja życiowa pacjenta"),
+    ("b_powod_zgloszenia", "B. Główny powód zgłoszenia się na wizytę"),
+    ("c_aktualne_objawy", "C. Szczegółowy wywiad dotyczący aktualnych objawów"),
+    ("d_historia_leczenia", "D. Historia dotychczasowego leczenia psychiatrycznego"),
+    ("e_leki", "E. Szczegółowy wywiad dotyczący stosowanych leków"),
+    (
+        "f_rozwoj_funkcjonowanie",
+        "F. Wcześniejsze i obecne trudności rozwojowe oraz funkcjonowanie",
+    ),
+    ("g_kontekst_zyciowy", "G. Sytuacja rodzinna, społeczna i zawodowa jako kontekst objawów"),
+    ("h_obciazenie_praca", "H. Obciążenie, wyczerpanie i objawy związane z pracą"),
+    ("i_objawy_depresyjne", "I. Objawy depresyjne, apatia i wycofanie"),
+    ("j_bezpieczenstwo", "J. Myśli samobójcze i inne kwestie bezpieczeństwa"),
+    ("k_objawy_psychotyczne", "K. Objawy psychotyczne i zaburzenia spostrzegania"),
+    ("l_inne_medyczne", "L. Inne istotne informacje medyczne"),
+    ("m_stan_psychiczny", "M. Stan psychiczny zaobserwowany przez lekarza"),
+    ("n_omowienie_leczenia", "N. Omówienie leczenia podczas wizyty"),
+    ("o_psychoterapia_zalecenia", "O. Psychoterapia, psychoedukacja i inne zalecenia"),
+    ("p_zwolnienie", "P. Zwolnienie lekarskie i uzasadnienie ograniczenia zdolności do pracy"),
+    ("q_podsumowanie_plan", "Q. Podsumowanie wizyty i plan dalszego postępowania"),
+]
+
+
+def _sekcja(litera: str) -> str:
+    return (
+        f"Treść sekcji {litera} z punktu 3 polecenia. Zostaw PUSTE, jeśli tego obszaru nie "
+        "poruszono — aplikacja sama oznaczy go jako nieporuszony. Nie wpisuj ogólników."
+    )
+
+
+class DokumentacjaDraft(BaseModel):
+    """Odpowiedź modelu — szkic do weryfikacji, nigdy dokument ostateczny."""
+
     jakosc_nagrania: JakoscNagrania = Field(
         description=(
             "Ocena użyteczności nagrania. BRAK_MOWY — w nagraniu nie ma zrozumiałej mowy "
             "(cisza, szum, nagranie uszkodzone lub nierozpoznawalne). SLABA — mowa częściowo "
-            "niezrozumiała. DOBRA — mowa zrozumiała. Oceniaj UCZCIWIE: jeśli nie słyszysz "
-            "wyraźnie wypowiedzi, wpisz BRAK_MOWY i pozostaw pozostałe pola puste."
+            "niezrozumiała. DOBRA — mowa zrozumiała. Oceniaj uczciwie: jeśli nie słyszysz "
+            "wyraźnie wypowiedzi, wpisz BRAK_MOWY i zostaw pozostałe pola puste."
         )
     )
     raw_transcript: str = Field(
         description=(
-            "Dosłowna transkrypcja tego, co FAKTYCZNIE słychać w nagraniu, po polsku. "
+            "Dosłowna transkrypcja tego, co faktycznie słychać w nagraniu, po polsku. "
             "Jeśli w nagraniu nie ma zrozumiałej mowy, zostaw to pole PUSTE. "
-            "Pod żadnym pozorem nie wymyślaj treści ani nie kopiuj jej z przykładów."
+            "Pod żadnym pozorem nie wymyślaj treści ani nie przenoś jej z przykładów."
         )
     )
-    klasyfikacje: list[Klasyfikacja] = Field(
-        default_factory=list,
-        description="Klasyfikacje, o które poproszono w poleceniu — wypisz dokładnie te i tylko te.",
-    )
-    ryzyko_samobojcze: RyzykoSamobojcze = Field(
-        description=(
-            "Ocena BINARNA myśli/ryzyka samobójczego. OBECNE jeśli w nagraniu pojawiają się "
-            "jakiekolwiek treści lub myśli samobójcze; NIEOBECNE jeśli pacjent neguje lub nic "
-            "na to nie wskazuje. Zawsze dokładnie jedna z dwóch wartości."
-        )
-    )
-    ryzyko_samobojcze_opis: str = Field(
-        default="",
-        description="Krótkie (1-2 zdania) uzasadnienie oceny ryzyka samobójczego.",
-    )
-    status_psychiczny: str = Field(
-        description="Opis aktualnego stanu psychicznego pacjenta (świadomość, orientacja, nastrój, afekt, tok myślenia, postrzeganie)."
-    )
-    objawy: list[str] = Field(
+    a_dane_ogolne: str = Field(default="", description=_sekcja("A"))
+    b_powod_zgloszenia: str = Field(default="", description=_sekcja("B"))
+    c_aktualne_objawy: str = Field(default="", description=_sekcja("C"))
+    d_historia_leczenia: str = Field(default="", description=_sekcja("D"))
+    e_leki: list[Lek] = Field(
         default_factory=list,
         description=(
-            "Objawy, które pacjent ma AKTUALNIE — zgłoszone jako trwające albo "
-            "zaobserwowane podczas wizyty. NIE wpisuj tu objawów, którym pacjent "
-            "zaprzeczył, ani takich, które już ustąpiły; te idą do `objawy_nieobecne`."
+            "Sekcja E: osobny wpis dla KAŻDEGO leku, o którym rozmawiano — obecnego "
+            "i wcześniejszego. Pusta lista, gdy o lekach nie rozmawiano."
         ),
     )
-    objawy_nieobecne: list[str] = Field(
+    f_rozwoj_funkcjonowanie: str = Field(default="", description=_sekcja("F"))
+    g_kontekst_zyciowy: str = Field(default="", description=_sekcja("G"))
+    h_obciazenie_praca: str = Field(default="", description=_sekcja("H"))
+    i_objawy_depresyjne: str = Field(default="", description=_sekcja("I"))
+    j_bezpieczenstwo: Bezpieczenstwo = Field(
+        description="Sekcja J — myśli samobójcze i inne kwestie bezpieczeństwa."
+    )
+    k_objawy_psychotyczne: str = Field(default="", description=_sekcja("K"))
+    l_inne_medyczne: str = Field(default="", description=_sekcja("L"))
+    m_stan_psychiczny: str = Field(default="", description=_sekcja("M"))
+    n_omowienie_leczenia: str = Field(default="", description=_sekcja("N"))
+    o_psychoterapia_zalecenia: str = Field(default="", description=_sekcja("O"))
+    p_zwolnienie: str = Field(default="", description=_sekcja("P"))
+    q_podsumowanie_plan: str = Field(default="", description=_sekcja("Q"))
+    do_weryfikacji: list[str] = Field(
         default_factory=list,
         description=(
-            "Objawy, o które pytano, a pacjent im ZAPRZECZYŁ, oraz takie, które "
-            "USTĄPIŁY. Przy każdym zaznacz którą sytuację opisujesz, na przykład: "
-            "myśli rezygnacyjne - neguje; albo: bezsenność - ustąpiła miesiąc temu. "
-            "Udokumentowany objaw nieobecny ma wartość kliniczną, więc nie pomijaj go — "
-            "przenieś tutaj, zamiast wpisywać do `objawy`."
-        ),
-    )
-    zalecenia_terapeuty: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Zalecenia, które specjalista FAKTYCZNIE wypowiedział podczas wizyty — "
-            "wypisz tylko to, co słychać w nagraniu. Nic nie dodawaj od siebie."
-        ),
-    )
-    zalecenia_proponowane: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Twoje własne propozycje zaleceń, których w nagraniu NIE było, a które warto "
-            "rozważyć. To sugestie do decyzji specjalisty — nie mieszaj ich z tym, co padło na wizycie."
-        ),
-    )
-    leki: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Leki, które specjalista FAKTYCZNIE zlecił podczas wizyty — nazwa, dawka i sposób "
-            "przyjmowania dokładnie tak, jak padły w nagraniu, na przykład: sertralina 50 mg rano. "
-            "Pod ŻADNYM pozorem niczego tu nie proponuj, nie uzupełniaj typowych dawek ani nie "
-            "domyślaj się leku z rozpoznania. Jeśli w nagraniu nie padła nazwa leku, zostaw "
-            "tę listę PUSTĄ. To ordynacja lekarska — wymyślona dawka jest niebezpieczna."
-        ),
-    )
-    podsumowanie: str = Field(
-        description="Krótkie 2-3 zdaniowe podsumowanie wizyty."
-    )
-
-
-class PsychiatricNoteDraft(_NoteBase):
-    """Kształt odpowiedzi modelu — kody są jeszcze propozycjami."""
-
-    kody_icd: list[ICDCode] = Field(
-        default_factory=list,
-        description=(
-            "Rozpoznania w klasyfikacjach wskazanych w poleceniu. Jedno rozpoznanie GŁÓWNE "
-            "i najwyżej jedno TOWARZYSZĄCE — nie listuj wszystkiego, co dałoby się obronić. "
-            "Gdy poproszono o kilka klasyfikacji, każde rozpoznanie powtórz osobnym wpisem "
-            "dla każdej z nich; to nadal jest jedno rozpoznanie, nie kilka."
+            "Konkretne punkty do sprawdzenia przez lekarza PRZED zatwierdzeniem: niejasne "
+            "lub sprzeczne informacje, nieustalone dawki, niepewne nazwy leków, nieczytelne "
+            "fragmenty nagrania. Każdy punkt jednym zdaniem, ze wskazaniem sekcji. "
+            "Pusta lista, gdy nie ma czego sprawdzać."
         ),
     )
 
 
-class PsychiatricNote(_NoteBase):
-    """Notatka zapisywana i pokazywana lekarzowi — kody po sprawdzeniu w rejestrze WHO."""
+class ZatwierdzonaDokumentacja(BaseModel):
+    """Dokumentacja po weryfikacji: tekst poprawiony przez lekarza.
 
-    kody_icd: list[VerifiedICDCode] = Field(default_factory=list)
+    Status ryzyka trzymamy osobno, choć jest też w tekście sekcji J — to jedyne pole,
+    którego aplikacja potrzebuje w postaci maszynowej (ostrzeżenie w historii), więc
+    lekarz potwierdza je jawnie, zamiast zdawać się na treść, którą mógł przeredagować.
+    """
+
+    dokument: str = Field(min_length=1)
+    ryzyko: Ryzyko
+    jakosc_nagrania: JakoscNagrania = JakoscNagrania.DOBRA

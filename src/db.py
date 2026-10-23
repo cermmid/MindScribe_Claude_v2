@@ -412,8 +412,14 @@ def get_approved_examples(
     doctor_id: str | _AllUsers,
     limit: int = FEW_SHOT_LIMIT,
 ) -> list[dict[str, str]]:
+    """Ostatnie zatwierdzone dokumentacje tej osoby — wzorzec stylu dla modelu.
+
+    Bez transkrypcji: przykład stylu to zatwierdzony dokument, nie zapis rozmowy.
+    Transkrypcji nie pobieramy wcale, skoro nie trafia do promptu — dane pacjenta,
+    których nie potrzebujemy, nie powinny w ogóle opuszczać bazy.
+    """
     stmt = (
-        sa.select(visits.c.raw_transcript, visits.c.doctor_note_corrected_json)
+        sa.select(visits.c.doctor_note_corrected_json)
         .where(
             visits.c.status == "approved",
             visits.c.doctor_note_corrected_json.is_not(None),
@@ -423,7 +429,4 @@ def get_approved_examples(
         .limit(limit)
     )
     with _conn() as conn:
-        return [
-            {"raw_transcript": transcript or "", "note_json": note_json}
-            for transcript, note_json in conn.execute(stmt)
-        ]
+        return [{"note_json": note_json} for (note_json,) in conn.execute(stmt)]

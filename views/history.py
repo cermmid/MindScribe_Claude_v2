@@ -4,9 +4,15 @@ import streamlit as st
 
 from src.auth import current_user_id
 from src.db import DatabaseUnavailable, get_visit, list_visits
-from src.formatting import display_name, humanize_visits_df, note_to_text
+from src.formatting import display_name, humanize_visits_df, risk_is_urgent, with_header
 from src.services import resolve_note_version
-from src.ui import copy_button, render_note
+from src.ui import (
+    copy_button,
+    render_document,
+    render_review_items,
+    render_risk_banner,
+    visit_caption,
+)
 
 st.title("📚 Historia wizyt")
 
@@ -16,7 +22,10 @@ except DatabaseUnavailable as exc:
     st.error(str(exc))
     st.stop()
 if not visits:
-    st.info("Brak zapisanych wizyt. Przejdź do **Nowa wizyta**, żeby wygenerować pierwszą notatkę.")
+    st.info(
+        "Brak zapisanych wizyt. Przejdź do **Nowa wizyta**, żeby przygotować pierwszą "
+        "dokumentację."
+    )
     st.stop()
 
 # Koszty i zużycie tokenów są celowo poza widokiem lekarza — patrz admin/app.py.
@@ -47,37 +56,53 @@ with st.expander("📂 Pokaż szczegóły wizyty", expanded=False):
         )
 
         resolved = resolve_note_version(visit)
-        corrected = visit.get("doctor_note_corrected_json")
-        if not resolved.is_corrected:
-            st.info("Wizyta niezatwierdzona — pokazana wersja oryginalna AI.")
+        full_text = ""
+        if resolved.document is None:
+            # Zapis w formacie, którego ta wersja nie składa — pokazujemy surowo,
+            # zamiast udawać, że dokumentacja jest pusta.
+            st.warning("Nie udało się odczytać dokumentacji tej wizyty — poniżej zapis źródłowy.")
+            st.code(resolved.source_json or "_brak_")
+        else:
+            if not resolved.is_approved:
+                st.info(
+                    "Wizyta niezatwierdzona — pokazany szkic przygotowany przez asystenta, "
+                    "przed weryfikacją lekarza."
+                )
+            visit_caption(visit.get("visit_type"))
+            _draft = resolved.draft or {}
+            render_risk_banner(
+                resolved.ryzyko,
+                pilne=risk_is_urgent(_draft) and not resolved.is_approved,
+            )
+            if not resolved.is_approved:
+                render_review_items(_draft.get("do_weryfikacji") or [])
+            render_document(resolved.document)
 
-        note = resolved.note
-        if note:
-            render_note(note, visit_type=visit.get("visit_type"))
-            note_text = note_to_text(
-                note,
+            full_text = with_header(
+                resolved.document,
                 title=display_name(visit),
                 visit_type=visit.get("visit_type"),
                 created_at=visit.get("created_at"),
                 doctor_name=visit.get("doctor_name"),
             )
             with st.expander("📄 Pełny tekst (zaznacz i skopiuj ręcznie)", expanded=False):
-                st.text(note_text)
-        else:
-            note_text = ""
-            st.code(resolved.source_json or "_brak_")
+                st.text(full_text)
 
-        with st.expander("📄 Surowa transkrypcja", expanded=False):
-            st.write(visit.get("raw_transcript") or "_brak_")
+        with st.expander("📄 Transkrypcja nagrania", expanded=False):
+            st.text(visit.get("raw_transcript") or "brak")
 
         with st.expander("🔬 Surowy JSON (debug)", expanded=False):
-            if visit.get("ai_note_original_json"):
-                st.json(json.loads(visit["ai_note_original_json"]))
-            if corrected:
-                st.caption("Wersja po korekcie:")
-                st.json(json.loads(corrected))
+            for label, key in (
+                ("Szkic asystenta:", "ai_note_original_json"),
+                ("Wersja zatwierdzona:", "doctor_note_corrected_json"),
+            ):
+                if raw := visit.get(key):
+                    st.caption(label)
+                    try:
+                        st.json(json.loads(raw))
+                    except ValueError:
+                        st.code(raw)
 
-        # Na samym dole, pod zwijanymi sekcjami — wcześniej przycisk siedział w środku
-        # bloku i trzeba było przewijać w górę, żeby go znaleźć.
-        if note_text:
-            copy_button(note_text, key=f"copy_hist_{selected_id}")
+        # Na samym dole, pod zwijanymi sekcjami — tam, gdzie lekarz kończy czytać.
+        if full_text:
+            copy_button(full_text, key=f"copy_hist_{selected_id}")

@@ -12,13 +12,12 @@ from .config import (
     GEMINI_MODEL,
     GEMINI_THINKING_BUDGET,
     USE_VERTEX_AI,
-    VERIFY_ICD10,
     _gcp_credentials_info,
     thinking_budget_for,
 )
 from .pricing import estimate_usage_and_cost
-from .prompts import DEFAULT_LOOKUP_SYSTEMS, SYSTEM_PROMPT, build_user_prompt
-from .schemas import PsychiatricNoteDraft
+from .prompts import SYSTEM_PROMPT, build_user_prompt
+from .schemas import DokumentacjaDraft
 
 
 def _vertex_credentials():
@@ -71,16 +70,11 @@ def _client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def _lookup_systems() -> list[str]:
-    """Klasyfikacje, dla których sami ustalimy kod — model może je zostawić puste."""
-    return [*DEFAULT_LOOKUP_SYSTEMS, "ICD-10"] if VERIFY_ICD10 else list(DEFAULT_LOOKUP_SYSTEMS)
-
-
 def _generation_config() -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
-        response_schema=PsychiatricNoteDraft,
+        response_schema=DokumentacjaDraft,
         temperature=0.2,
         thinking_config=types.ThinkingConfig(
             thinking_budget=thinking_budget_for(GEMINI_MODEL, GEMINI_THINKING_BUDGET)
@@ -100,11 +94,25 @@ def _usage_of(response) -> dict:
     )
 
 
-def _parse(response) -> PsychiatricNoteDraft:
+def _parse(response) -> DokumentacjaDraft:
     parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, PsychiatricNoteDraft):
+    if isinstance(parsed, DokumentacjaDraft):
         return parsed
-    return PsychiatricNoteDraft.model_validate_json(response.text)
+    try:
+        return DokumentacjaDraft.model_validate_json(response.text)
+    except ValueError as exc:
+        # Szczegółowa dokumentacja jest długa. Gdy model urwie odpowiedź w pół (limit
+        # tokenów, przerwane połączenie), JSON jest niedomknięty — bez tej informacji
+        # lekarz zobaczyłby tylko niezrozumiały błąd walidacji.
+        reason = ""
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            reason = str(getattr(candidates[0], "finish_reason", "") or "")
+        raise RuntimeError(
+            "Model zwrócił niekompletną dokumentację"
+            + (f" (powód zakończenia: {reason})" if reason else "")
+            + ". Spróbuj wygenerować ponownie."
+        ) from exc
 
 
 def generate_note_from_audio(
@@ -112,12 +120,12 @@ def generate_note_from_audio(
     few_shot_examples: list[dict],
     *,
     mime_type: str | None = None,
-    klasyfikacje: list[str] | str = "ICD-10",
-) -> tuple[PsychiatricNoteDraft, str, dict]:
-    """Send audio inline (as bytes) and request a structured note.
+    visit_type: str | None = None,
+) -> tuple[DokumentacjaDraft, str, dict]:
+    """Wyślij nagranie inline i poproś o dokumentację w schemacie `DokumentacjaDraft`.
 
-    Inline payload works for both Vertex AI and the Developer API. Vertex AI
-    does not expose the Files API, so this is the portable path.
+    Inline działa i na Vertex AI, i na Developer API — Vertex nie ma Files API,
+    więc to jedyna ścieżka wspólna dla obu.
     """
     client = _client()
     mime = resolve_audio_mime(audio_path.suffix, mime_type)
@@ -125,12 +133,7 @@ def generate_note_from_audio(
         data=audio_path.read_bytes(),
         mime_type=mime,
     )
-    prompt = build_user_prompt(
-        few_shot_examples,
-        transcript=None,
-        klasyfikacje=klasyfikacje,
-        lookup_systems=_lookup_systems(),
-    )
+    prompt = build_user_prompt(few_shot_examples, transcript=None, visit_type=visit_type)
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
@@ -145,16 +148,11 @@ def generate_note_from_text(
     transcript: str,
     few_shot_examples: list[dict],
     *,
-    klasyfikacje: list[str] | str = "ICD-10",
-) -> tuple[PsychiatricNoteDraft, str, dict]:
-    """Reserved for the future Whisper → text → Gemini pipeline."""
+    visit_type: str | None = None,
+) -> tuple[DokumentacjaDraft, str, dict]:
+    """Ścieżka zarezerwowana na przyszły podział: osobna transkrypcja → dokumentacja z tekstu."""
     client = _client()
-    prompt = build_user_prompt(
-        few_shot_examples,
-        transcript=transcript,
-        klasyfikacje=klasyfikacje,
-        lookup_systems=_lookup_systems(),
-    )
+    prompt = build_user_prompt(few_shot_examples, transcript=transcript, visit_type=visit_type)
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[prompt],

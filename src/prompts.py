@@ -1,85 +1,84 @@
-# Klasyfikacje, dla których aplikacja sama ustala kod w rejestrze WHO. Reszta musi
-# przyjść od modelu z kodem, bo nie ma kto go uzupełnić.
-DEFAULT_LOOKUP_SYSTEMS = ["ICD-11"]
+"""Polecenia dla modelu.
 
-SYSTEM_PROMPT = """Jesteś doświadczonym asystentem klinicznym wspomagającym specjalistę zdrowia psychicznego
-(psychiatrę, psychologa lub psychoterapeutę).
-Twoje zadanie: na podstawie nagrania (lub transkrypcji) wizyty psychiatrycznej w języku polskim
-przygotuj ustrukturyzowaną notatkę medyczną.
-
-ZASADA NADRZĘDNA — ZAKAZ ZMYŚLANIA:
-- Opisujesz WYŁĄCZNIE to, co faktycznie słychać w dołączonym nagraniu.
-- Jeśli nagranie jest ciche, uszkodzone, zawiera tylko szum albo nie da się z niego nic zrozumieć:
-  ustaw `jakosc_nagrania` na BRAK_MOWY, zostaw `raw_transcript` PUSTE, a pozostałe pola tekstowe
-  wypełnij zwrotem "brak danych". NIE twórz wtedy żadnej transkrypcji ani objawów.
-- Lepiej zwrócić pustą notatkę niż wymyśloną. Wymyślona treść w dokumentacji medycznej jest
-  groźna dla pacjenta.
-- PRZYKŁADY poniżej służą WYŁĄCZNIE do naśladowania stylu pisania. NIGDY nie przepisuj z nich
-  treści, objawów, rozpoznań ani transkrypcji do nowej notatki.
-
-Pozostałe zasady:
-- Pisz po polsku, językiem klinicznym, ale zwięźle.
-- Trzymaj się ŚCIŚLE schematu JSON podanego przez system — żadnych dodatkowych pól, żadnego tekstu poza JSON.
-- KRYTYCZNE: pole `ryzyko_samobojcze` ZAWSZE wypełnij jedną z dwóch wartości — OBECNE lub NIEOBECNE.
-  Wpisz OBECNE, jeśli w nagraniu pojawiają się jakiekolwiek myśli, plany, zamiary lub treści samobójcze
-  (także pośrednie). Wpisz NIEOBECNE, jeśli pacjent je neguje lub nic na nie nie wskazuje. W
-  `ryzyko_samobojcze_opis` w 1-2 zdaniach uzasadnij ocenę. To informacja krytyczna dla specjalisty — nie pomijaj.
-  Gdy nagranie jest niezrozumiałe, wpisz NIEOBECNE i zaznacz w opisie, że nagranie nie pozwoliło tego ocenić.
-- Rozpoznania podawaj wyłącznie wtedy, gdy obraz kliniczny je uzasadnia; dla każdej propozycji
-  oszacuj realistyczną pewność.
-- KRYTYCZNE: podaj JEDNO rozpoznanie GŁÓWNE i NAJWYŻEJ JEDNO TOWARZYSZĄCE. Główne to takie,
-  które najlepiej tłumaczy całość obrazu klinicznego — oznacz je `rozpoznanie_glowne: true`.
-  Towarzyszące dodawaj tylko wtedy, gdy realnie zmienia postępowanie, i oznacz je `false`.
-  Liczy się liczba RÓŻNYCH rozpoznań, a nie liczba wpisów: gdy poproszono o kilka klasyfikacji,
-  to samo rozpoznanie powtarzasz osobnym wpisem dla każdej z nich i to nadal jest JEDNO
-  rozpoznanie. Objaw mieszczący się w rozpoznaniu głównym NIE jest osobnym rozpoznaniem —
-  bezsenność w epizodzie depresyjnym opisujesz w objawach, nie jako drugie rozpoznanie.
-  Notatka ma zawierać rozpoznanie robocze, a nie listę wszystkiego, co dałoby się obronić.
-- KRYTYCZNE: rozdzielaj objawy AKTUALNE od NIEOBECNYCH. Do `objawy` trafia tylko to, co
-  pacjent ma teraz. Objaw, któremu pacjent ZAPRZECZYŁ ("nie mam myśli rezygnacyjnych"),
-  oraz taki, który JUŻ USTĄPIŁ ("bezsenność minęła miesiąc temu"), idzie do
-  `objawy_nieobecne` z adnotacją, o którą sytuację chodzi. Wywiad obejmuje przeszłość
-  pacjenta — sama wzmianka o objawie NIE znaczy, że pacjent ma go dzisiaj.
-  Gdy z nagrania nie wynika jasno, czy objaw trwa, wpisz go do `objawy_nieobecne`
-  i zaznacz wątpliwość. Objaw fałszywie opisany jako obecny jest w dokumentacji
-  groźniejszy niż objaw wymieniony wśród nieobecnych.
-- KRYTYCZNE: pole `leki` wypełniasz WYŁĄCZNIE lekami, które specjalista wypowiedział w nagraniu —
-  z nazwą, dawką i sposobem przyjmowania w takim brzmieniu, w jakim padły. Nie proponujesz tu
-  niczego od siebie, nie uzupełniasz "typowej" dawki, nie wnioskujesz leku z rozpoznania i nie
-  przenosisz leków z PRZYKŁADÓW. Jeśli żaden lek nie padł, zostaw listę PUSTĄ — pusta lista jest
-  poprawną odpowiedzią. To ordynacja lekarska: wymyślona nazwa lub dawka zagraża pacjentowi.
-  Propozycje terapeutyczne, także farmakologiczne, należą do `zalecenia_proponowane`, nie tutaj.
-- Jeśli w PRZYKŁADACH widzisz styl notatek tej konkretnej osoby — naśladuj sposób formułowania
-  zdań, długość i akcenty, ale nie treść.
+Treść kliniczna — rola, zasady, struktura sekcji A–Q, sposób redagowania — żyje w
+`prompts/dokumentacja.md`, a nie tutaj. To celowe: to tekst lekarza, nie programisty,
+i ma dać się poprawić bez dotykania kodu. Ten moduł dokleja do niego wyłącznie reguły
+techniczne: jak sekcje mapują się na pola odpowiedzi, co zrobić z niemym nagraniem
+i jak traktować przykłady stylu.
 """
+
+import json
+from pathlib import Path
+
+_PROMPT_FILE = Path(__file__).resolve().parent.parent / "prompts" / "dokumentacja.md"
+
+
+def _load_clinical_prompt() -> str:
+    text = _PROMPT_FILE.read_text(encoding="utf-8").strip()
+    if not text:
+        # Pusty plik dałby modelowi same reguły techniczne — dokumentację bez zasad
+        # klinicznych. Lepiej nie wystartować niż wygenerować coś takiego.
+        raise RuntimeError(f"Pusty prompt kliniczny: {_PROMPT_FILE}")
+    return text
+
+
+TECHNICAL_RULES = """\
+8. Zasady techniczne aplikacji
+
+Odpowiadasz wyłącznie w formacie JSON zgodnym ze schematem. Pola `a_dane_ogolne` … \
+`q_podsumowanie_plan` odpowiadają sekcjom A–Q z punktu 3.
+
+- Sekcję, której obszaru nie poruszono podczas konsultacji, zostaw PUSTĄ. Aplikacja sama \
+oznaczy ją jako nieporuszoną. Nie wpisuj tam ogólników, zastrzeżeń ani zdań w rodzaju \
+„brak danych".
+- Sekcję omówioną częściowo wypełnij tym, co padło, a brakujące elementy oznacz wewnątrz \
+niej zgodnie z punktem 5.
+- `e_leki`: osobny wpis dla każdego leku, o którym rozmawiano. W `opis` uwzględnij punkty \
+1–16 sekcji E w zakresie, w jakim padły w rozmowie.
+- `j_bezpieczenstwo.status`: OBECNE, ZAPRZECZA albo NIE_OCENIANO. Wybierz ZAPRZECZA wyłącznie \
+wtedy, gdy temat został poruszony i pacjent zaprzeczył. Jeśli nie pytano — NIE_OCENIANO.
+- `j_bezpieczenstwo.pilne`: true, gdy nagranie wskazuje na aktualne zagrożenie życia lub zdrowia.
+- `do_weryfikacji`: konkretne kwestie do sprawdzenia przez lekarza przed zatwierdzeniem — \
+niejasne lub sprzeczne informacje, nieustalone dawki, niepewne nazwy leków, nieczytelne \
+fragmenty. Każda jednym zdaniem, ze wskazaniem sekcji.
+- Nagranie bez zrozumiałej mowy (cisza, szum, uszkodzenie): `jakosc_nagrania` = BRAK_MOWY, \
+`raw_transcript` puste, wszystkie sekcje puste, `j_bezpieczenstwo.status` = NIE_OCENIANO. \
+Nie twórz żadnej treści — pusta dokumentacja jest tu jedyną poprawną odpowiedzią.
+- PRZYKŁADY zatwierdzonej dokumentacji, jeśli są dołączone, pokazują wyłącznie sposób \
+pisania tej osoby. Nigdy nie przenoś z nich treści, objawów, leków ani dawek.
+"""
+
+SYSTEM_PROMPT = _load_clinical_prompt() + "\n\n" + TECHNICAL_RULES
+
+
+def _document_of(note_json: str) -> str:
+    """Tekst zatwierdzonej dokumentacji z zapisu w bazie; pusty, gdy zapis jest w innym formacie."""
+    try:
+        data = json.loads(note_json or "")
+    except (TypeError, ValueError):
+        return ""
+    return str(data.get("dokument") or "").strip() if isinstance(data, dict) else ""
 
 
 def build_few_shot_block(examples: list[dict]) -> str:
-    """examples: list of {raw_transcript: str, note_json: str} for last approved visits.
+    """Zatwierdzona dokumentacja tej osoby jako wzorzec stylu.
 
-    **Transkrypcje NIE trafiają do promptu.** Te przykłady mają jeden cel: pokazać
-    modelowi styl pisania tej osoby — a styl siedzi w zatwierdzonej notatce, nie
-    w surowym zapisie rozmowy. Wklejanie transkrypcji kosztowało przy 20-minutowych
-    wizytach ~6 000 tokenów na przykład (przy trzech: ~18 000 na każde zapytanie),
-    wydłużało generowanie i było dokładnie tym kanałem, którym treść cudzej wizyty
-    mogła przeciec do nowej notatki. Klucz `raw_transcript` zostaje w sygnaturze,
-    bo tak zwraca go baza — po prostu go nie używamy.
+    Bez transkrypcji: styl jest w dokumencie, który lekarz poprawił i zatwierdził, a nie
+    w zapisie rozmowy. Transkrypcja w promptcie to tokeny i czas generowania za darmo
+    oraz kanał, którym treść jednej wizyty mogłaby trafić do drugiej.
     """
-    if not examples:
+    documents = [doc for ex in examples if (doc := _document_of(ex.get("note_json", "")))]
+    if not documents:
         return ""
 
     blocks = [
-        "### PRZYKŁADY ZATWIERDZONYCH NOTATEK TEJ OSOBY\n"
-        "UWAGA: to są gotowe notatki z INNYCH, wcześniejszych wizyt. Pokazują wyłącznie\n"
-        "SPOSÓB PISANIA tej osoby — długość zdań, dobór słów, rozłożenie akcentów.\n"
-        "Nie są materiałem źródłowym: nie przepisuj z nich żadnej treści, żadnego objawu,\n"
-        "rozpoznania ani leku do nowej notatki.\n"
+        "### PRZYKŁADY ZATWIERDZONEJ DOKUMENTACJI TEJ OSOBY\n"
+        "To dokumentacja z INNYCH, wcześniejszych wizyt, poprawiona przez lekarza. Pokazuje\n"
+        "wyłącznie SPOSÓB PISANIA — długość zdań, dobór słów, poziom szczegółowości.\n"
+        "Nie jest materiałem źródłowym: nie przenoś z niej żadnej treści.\n"
     ]
-    for i, ex in enumerate(examples, 1):
-        blocks.append(
-            f"--- PRZYKŁAD {i} (inna wizyta, tylko wzorzec stylu) ---\n"
-            f"{ex['note_json']}\n"
-        )
+    for i, doc in enumerate(documents, 1):
+        blocks.append(f"--- PRZYKŁAD {i} (inna wizyta, tylko wzorzec stylu) ---\n{doc}\n")
     blocks.append("--- KONIEC PRZYKŁADÓW ---\n")
     return "\n".join(blocks)
 
@@ -87,84 +86,30 @@ def build_few_shot_block(examples: list[dict]) -> str:
 def build_user_prompt(
     few_shot_examples: list[dict],
     transcript: str | None = None,
-    klasyfikacje: list[str] | str = "ICD-10",
-    lookup_systems: list[str] | None = None,
+    *,
+    visit_type: str | None = None,
 ) -> str:
-    """Build the text prompt. If `transcript` is given, append it; otherwise rely on attached audio."""
-    if isinstance(klasyfikacje, str):
-        klasyfikacje = [klasyfikacje]
-    wanted = [k for k in klasyfikacje if k] or ["ICD-10"]
-
+    """Polecenie dla jednej wizyty. Z `transcript` — praca na tekście, bez — na nagraniu."""
     parts = [build_few_shot_block(few_shot_examples)]
 
-    listing = ", ".join(f"**{k}**" for k in wanted)
-    rule = [
-        "### KLASYFIKACJE ROZPOZNAŃ",
-        f"Dla tej wizyty użyj: {listing}.",
-        f"W polu `klasyfikacje` wypisz dokładnie: {', '.join(wanted)}.",
-    ]
-    if len(wanted) > 1:
-        rule.append(
-            "To ten sam obraz kliniczny wyrażony w kilku systemach — dla KAŻDEGO rozpoznania "
-            "utwórz osobny wpis w `kody_icd` dla każdej z tych klasyfikacji, oznaczając "
-            "w polu `klasyfikacja` tę właściwą. Nie pomijaj żadnej i nie mieszaj kodów między nimi."
-        )
-    rule.append(
-        "Pole `description` to nazwa rozpoznania **PO POLSKU** — wypełnij je zawsze, dla każdej "
-        "klasyfikacji. Nazwy DSM-5 są angielskie: przetłumacz je na polski, nie przepisuj."
-    )
-
-    # Kod wolno pominąć TYLKO tam, gdzie aplikacja sama go ustali z rejestru.
-    # Dla pozostałych klasyfikacji pusty kod oznacza wpis bezużyteczny dla lekarza.
-    checked = [k for k in wanted if k in (lookup_systems or DEFAULT_LOOKUP_SYSTEMS)]
-    unchecked = [k for k in wanted if k not in checked]
-
-    if unchecked:
-        rule.append(
-            f"Dla {', '.join(unchecked)} pole `code` jest **OBOWIĄZKOWE** — podaj konkretny kod "
-            "przy każdym rozpoznaniu. Nikt go za Ciebie nie uzupełni, więc wpis bez kodu jest "
-            "dla specjalisty bezużyteczny."
-        )
-    if checked:
-        # Wcześniej ta reguła pozwalała zostawić kod pusty, bo „rejestr go uzupełni".
-        # Gdy rejestr czegoś nie znajdzie albo jest nieosiągalny, wpis zostaje bez kodu
-        # i jest dla specjalisty bezwartościowy. Kod ma być zawsze — rejestr go
-        # potwierdza albo poprawia, a niepotwierdzony jest wyraźnie oznaczony.
-        # Furtka „gdy nie masz pojęcia, zostaw puste" była nadużywana — model wybierał
-        # ją niemal zawsze i kolumna z kodem wracała pusta. Pusty kod nie jest
-        # ostrożnością, tylko brakiem odpowiedzi; ostrożność wyraża `confidence`.
-        rule.append(
-            f"Dla {', '.join(checked)} pole `code` jest **OBOWIĄZKOWE** dokładnie tak samo. "
-            "Podaj swój najlepszy kod, nawet jeśli nie masz pewności — zostanie sprawdzony "
-            "w oficjalnym rejestrze WHO i w razie potrzeby poprawiony, a niepotwierdzony "
-            "dostanie wyraźne ostrzeżenie dla specjalisty. Niepewność wyrażaj **niższym "
-            "`confidence`**, nie pustym polem: puste pole nie jest ostrożnością, tylko "
-            "brakiem odpowiedzi, i jest bezużyteczne."
-        )
-        rule.append(
-            f"Za to dla {', '.join(checked)} pole `termin_wyszukiwania` jest **OBOWIĄZKOWE**: wpisz "
-            "tam tę samą nazwę rozpoznania PO ANGIELSKU, w brzmieniu WHO, "
-            "na przykład: Generalised anxiety disorder. "
-            "Rejestr WHO nie zna polskich nazw — po polsku nie znajdziemy niczego."
-        )
-    if "DSM-5" in wanted:
-        rule.append(
-            "Przy DSM-5 podaj **pełną nazwę rozpoznania wg DSM-5** wraz z kodem, którego DSM-5 "
-            "używa (są to kody ICD-10-CM)."
-        )
-    parts.append("\n".join(rule) + "\n")
+    # Typ wizyty zmienia sens sekcji Q („zmiany od poprzedniej wizyty") i D. Bez tej
+    # informacji model musi zgadywać, czy brak historii to luka, czy pierwsza wizyta.
+    kind = (visit_type or "").strip().lower()
+    if kind.startswith("pierw"):
+        parts.append("### TYP WIZYTY\nPierwsza wizyta u tego lekarza.\n")
+    elif kind.startswith("kolej"):
+        parts.append("### TYP WIZYTY\nWizyta kolejna — pacjent jest już leczony u tego lekarza.\n")
 
     if transcript:
-        parts.append(f"### TRANSKRYPCJA NOWEJ WIZYTY:\n{transcript}\n")
-        parts.append("Wygeneruj notatkę zgodnie ze schematem.")
+        parts.append(f"### TRANSKRYPCJA KONSULTACJI\n{transcript}\n")
+        parts.append("Przygotuj dokumentację zgodnie z poleceniem i schematem.")
     else:
         parts.append(
-            "### NOWA WIZYTA\n"
-            "W załączeniu nagranie audio nowej wizyty psychiatrycznej.\n"
-            "1. Najpierw posłuchaj nagrania i oceń, czy zawiera zrozumiałą mowę.\n"
-            "2. Jeśli TAK — przepisz dosłowną transkrypcję do pola `raw_transcript`, "
-            "a potem wygeneruj pozostałe pola na jej podstawie.\n"
-            "3. Jeśli NIE (cisza, szum, nagranie nieczytelne) — ustaw `jakosc_nagrania` na BRAK_MOWY, "
-            "zostaw `raw_transcript` puste i NIE wymyślaj treści wizyty."
+            "### NAGRANIE KONSULTACJI\n"
+            "W załączeniu nagranie audio konsultacji.\n"
+            "1. Najpierw oceń, czy nagranie zawiera zrozumiałą mowę.\n"
+            "2. Jeśli TAK — przepisz dosłowną transkrypcję do `raw_transcript`, a następnie "
+            "przygotuj dokumentację na jej podstawie.\n"
+            "3. Jeśli NIE — postąp zgodnie z zasadą o nagraniu bez zrozumiałej mowy."
         )
     return "\n".join(p for p in parts if p)

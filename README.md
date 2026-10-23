@@ -7,16 +7,18 @@
 > ⚠️ **Ta wersja musi mieć własną bazę i własne logowanie.** To nie jest zalecenie porządkowe,
 > tylko warunek bezpieczeństwa danych — szczegóły w sekcji *Rozdzielenie od pierwszej wersji*.
 
-Aplikacja webowa dla **psychiatrów, psychologów i psychoterapeutów**: nagranie wizyty → transkrypcja i ustrukturyzowana notatka (Gemini 2.5 Flash, Structured Outputs) → korekta i zatwierdzenie przez specjalistę → zapis w bazie.
+Aplikacja webowa wspierająca **lekarza w dokumentowaniu konsultacji**, w szczególności psychiatrycznych: nagranie wizyty → transkrypcja i szczegółowa, uporządkowana dokumentacja w sekcjach A–Q → weryfikacja i poprawki lekarza w jednym dokumencie → zatwierdzenie i zapis w bazie.
 
-Zatwierdzone notatki są doklejane do kolejnych promptów jako **few-shot examples** (3 ostatnie), więc model uczy się stylu konkretnej osoby. Każdy widzi wyłącznie swoje wizyty.
+Aplikacja **dokumentuje, nie decyduje**: nie stawia rozpoznań, nie tworzy planów leczenia i nie przesądza o zdolności do pracy. Zapisuje to, co padło podczas konsultacji, a czego nie poruszono — oznacza jako nieporuszone.
+
+Zatwierdzona dokumentacja jest doklejana do kolejnych promptów jako **wzorzec stylu** (3 ostatnie), więc model uczy się sposobu pisania konkretnej osoby. Każdy widzi wyłącznie swoje wizyty.
 
 ## Stack
 
 - **UI + backend**: Python 3.11+, Streamlit (multi-page)
-- **AI**: Gemini 2.5 Flash przez `google-genai` SDK, Structured Outputs (Pydantic → `response_schema`)
-- **Audio**: przesyłane inline i analizowane multimodalnie (transkrypcja + notatka w jednym wywołaniu). Files API odpada — nie istnieje w Vertex AI
-- **Rozpoznania**: ICD-11 potwierdzane w oficjalnym rejestrze WHO; ICD-10 i DSM-5 przyjmowane bez odpytywania (patrz niżej)
+- **AI**: Gemini 2.5 Pro przez `google-genai` SDK, Structured Outputs (Pydantic → `response_schema`)
+- **Prompt kliniczny**: zwykły plik tekstowy `prompts/dokumentacja.md` — poprawiasz go bez dotykania kodu (patrz niżej)
+- **Audio**: przesyłane inline i analizowane multimodalnie (transkrypcja + dokumentacja w jednym wywołaniu). Files API odpada — nie istnieje w Vertex AI
 - **Baza**: PostgreSQL przez SQLAlchemy (lokalnie SQLite bez konfiguracji)
 - **Logowanie**: Auth0 przez natywne `st.login()`
 
@@ -42,22 +44,24 @@ Panel właściciela (koszty, statystyki) to osobna aplikacja: `streamlit run adm
 ```
 MindScribe/
 ├── app.py                    # router: logowanie, init bazy, nawigacja
+├── prompts/
+│   └── dokumentacja.md       # PROMPT KLINICZNY — rola, zasady, sekcje A–Q (edytuj tutaj)
 ├── views/
 │   ├── home.py               # strona główna
-│   ├── new_visit.py          # nagranie → generacja → korekta → zapis
+│   ├── new_visit.py          # nagranie → dokumentacja → weryfikacja i edycja → zapis
 │   └── history.py            # własne wizyty
 ├── src/
 │   ├── config.py             # .env + stałe
-│   ├── schemas.py            # PsychiatricNote (Pydantic, response_schema dla Gemini)
-│   ├── prompts.py            # system prompt + builder few-shot
+│   ├── schemas.py            # sekcje A–Q (response_schema dla Gemini) + wersja zatwierdzona
+│   ├── prompts.py            # prompt kliniczny + reguły techniczne + wzorce stylu
+│   ├── formatting.py         # odpowiedź modelu → jeden dokument tekstowy
 │   ├── db.py                 # SQLAlchemy: visits, filtr właściciela, agregaty panelu
 │   ├── services.py           # przypadki użycia — bez zależności od UI
 │   ├── auth.py               # logowanie OIDC, tożsamość użytkownika
-│   ├── icd.py                # weryfikacja rozpoznań w rejestrze WHO
 │   ├── audio.py              # zapis uploadu, typ MIME, wykrywanie ciszy
 │   └── gemini_client.py      # generate_note_from_audio() — audio inline + Structured Output
 ├── admin/app.py              # panel właściciela (osobne hasło)
-├── tests/                    # 115 testów; db też na Postgresie przez TEST_DATABASE_URL
+├── tests/                    # 130 testów; db też na Postgresie przez TEST_DATABASE_URL
 └── data/                     # lokalny SQLite i nagrania (gitignored)
 ```
 
@@ -65,8 +69,8 @@ MindScribe/
 
 Ta wersja **nie może dzielić bazy ani logowania** z `cermmid/MindScribe`. Trzy powody, każdy wystarczający sam z siebie:
 
-1. **Wspólna baza znaczy pisanie do dokumentacji prawdziwych pacjentów.** Pierwsza wersja jest używana na realnych wizytach. Nieudana migracja schematu albo błąd w `update_visit` uderzyłby w notatki, które już istnieją — a tu nie ma kosza, do którego dałoby się sięgnąć.
-2. **Wspólna baza otwiera z powrotem wyciek zamknięty w fazie B.** `load_few_shot_examples` dokleja zatwierdzone notatki do kolejnych promptów. Przy wspólnej bazie notatki z jednej wersji trafiałyby do zapytań drugiej — czyli transkrypcja pacjenta jednej osoby do promptu drugiej.
+1. **Wspólna baza znaczy pisanie do dokumentacji prawdziwych pacjentów.** Pierwsza wersja jest używana na realnych wizytach. Nieudana migracja schematu albo błąd w `update_visit` uderzyłby w dokumentację, która już istnieje — a tu nie ma kosza, do którego dałoby się sięgnąć.
+2. **Wspólna baza otwiera z powrotem wyciek zamknięty w fazie B.** `load_few_shot_examples` dokleja zatwierdzoną dokumentację do kolejnych promptów. Przy wspólnej bazie dokumentacja z jednej wersji trafiałaby do zapytań drugiej — a to są dane pacjentów.
 3. **Wspólne `cookie_secret` krzyżowo podpisuje sesje.** Dwie aplikacje pod różnymi adresami, ten sam podpis ciasteczka — sesja z jednej bywa uznawana przez drugą.
 
 Co ta wersja musi mieć **własne**:
@@ -79,7 +83,7 @@ Co ta wersja musi mieć **własne**:
 | Aplikacja na Streamlit Cloud (inny adres) | Inaczej nadpisałaby pierwszą wersję |
 | `admin_password` do panelu właściciela | Osobne dane, osobny dostęp |
 
-Co **można współdzielić**: poświadczenia Gemini/Vertex AI (`GEMINI_API_KEY` albo service account) i klucze WHO ICD (`ICD_CLIENT_ID`, `ICD_CLIENT_SECRET`). To usługi zewnętrzne odpytywane tylko do odczytu — nie trzymają danych pacjentów i nie ma w nich stanu, który jedna wersja mogłaby zepsuć drugiej.
+Co **można współdzielić**: poświadczenia Gemini/Vertex AI (`GEMINI_API_KEY` albo service account). To usługa zewnętrzna bez stanu — nie trzyma danych pacjentów między zapytaniami i nie ma w niej niczego, co jedna wersja mogłaby zepsuć drugiej.
 
 ⚠️ Bez `DATABASE_URL` aplikacja domyślnie używa lokalnego SQLite w `data/`. Na Streamlit Cloud ten plik znika przy każdym restarcie — czyli *wygląda* na działającą i po cichu gubi wizyty. Ustaw `DATABASE_URL` od pierwszego uruchomienia.
 
@@ -111,7 +115,7 @@ Każdy push do tego brancha automatycznie redeployuje apkę.
 
 ### Ograniczenia darmowego hostingu — przeczytaj zanim wyślesz link
 
-- **Nagrania znikają przy restarcie.** Streamlit Cloud ma efemeryczny dysk. Wizyty i konta są bezpieczne, bo baza jest zewnętrzna (patrz *Baza danych*), ale pliki audio z `data/audio/` kasują się przy redeployu. Nagranie i tak jest potrzebne wyłącznie na czas wygenerowania notatki.
+- **Nagrania znikają przy restarcie.** Streamlit Cloud ma efemeryczny dysk. Wizyty i konta są bezpieczne, bo baza jest zewnętrzna (patrz *Baza danych*), ale pliki audio z `data/audio/` kasują się przy redeployu. Nagranie i tak jest potrzebne wyłącznie na czas przygotowania dokumentacji.
 - **URL jest publiczny**, ale bez konta nie widać niczego — logowanie idzie przez Auth0.
 - **~1 GB RAM, 1 CPU**. Wystarczy kilku osobom i plikom do ~200 MB.
 - **Brak BAA z Google**. ZERO realnych danych pacjentów na tym deploy'u. Fikcyjne nagrania tylko.
@@ -140,7 +144,7 @@ Kluczem właściciela jest `st.user.sub` — stabilny identyfikator od dostawcy,
 
 **Filtr właściciela zawodzi zamknięciem.** Parametr jest wymagany we wszystkich funkcjach czytających i piszących; pominięcie go to `TypeError`, a nie ciche „pokaż wszystko". Świadome zapytanie o wszystkich wymaga jawnego `ALL_USERS` — widocznego w kodzie i w przeglądzie zmian. Wcześniej domyślne `None` znaczyło „bez filtrowania", więc jedna zapomniana linia pokazywała cudze wizyty i nic tego nie sygnalizowało.
 
-Najważniejsze miejsce to few-shot: bez filtra zatwierdzone notatki wszystkich trafiałyby do promptu, czyli **transkrypcja pacjenta jednej osoby lądowałaby w zapytaniu drugiej**.
+Najważniejsze miejsce to few-shot: bez filtra zatwierdzona dokumentacja wszystkich trafiałaby do promptu, czyli **dokumentacja pacjenta jednej osoby lądowałaby w zapytaniu drugiej**.
 
 Panel właściciela (`admin/app.py`) celowo widzi wszystkich — to jedyne miejsce bez filtra, chronione osobnym hasłem i ograniczone do metadanych.
 
@@ -174,49 +178,33 @@ Warto o nich wiedzieć, bo żadna nie rzuca błędu:
 - `REAL` w Postgresie to float4 — koszt trzymamy jako `Numeric(14,6)`.
 - `SUM()` po kolumnie całkowitej zwraca `Decimal`; konwersja jest w jednym miejscu, przy odczycie wiersza.
 
-## Weryfikacja rozpoznań w rejestrze WHO
+## Prompt kliniczny i struktura dokumentacji
 
-**Model językowy nie może być źródłem kodów rozpoznań.** W testach podał kody ICD-11, które *istnieją*, ale znaczą co innego niż twierdził — np. `QE80` („ofiara przestępstwa lub terroryzmu") opisane jako zaburzenia snu, czy `6A70` (pojedynczy epizod depresyjny) podane jako lęk uogólniony. Walidacja formatu tego nie wykryje, bo kody są prawdziwe. ICD-11 obowiązuje dopiero od 2022 i jest w danych treningowych nieporównanie słabiej reprezentowana niż ICD-10, więc mapowanie kod ↔ znaczenie jest u modelu niepewne.
+### Gdzie poprawiać prompt
 
-**ICD-10 to jednak inna historia.** Ta klasyfikacja jest w danych treningowych od dekad i model radzi sobie z nią dobrze — w praktyce odpytywanie rejestru dawało tu fałszywe „nie znaleziono" zamiast pomagać. Dlatego **ICD-10 przyjmujemy od modelu bez sprawdzania** (`VERIFY_ICD10=true` przywraca), a rejestr odpytujemy dla **ICD-11**, gdzie model demonstracyjnie się myli.
+Cała treść kliniczna — rola asystenta, zasady nadrzędne, sekcje A–Q, sposób redagowania i postępowanie z niepewnymi danymi — jest w **`prompts/dokumentacja.md`**. To zwykły plik tekstowy: poprawiasz go jak dokument, commitujesz, a aplikacja po przebudowie używa nowej wersji. Kodu nie trzeba ruszać.
 
-Wpisy mają trzy stany, nie dwa — „nie sprawdzano" to co innego niż „sprawdzono i nie ma":
+Aplikacja dokleja do niego tylko krótki blok **reguł technicznych** (`src/prompts.py`): jak sekcje przekładają się na pola odpowiedzi, co zrobić z nagraniem bez mowy i jak traktować wzorce stylu. Jeśli w pliku zmienisz nazwę albo kolejność sekcji, trzeba też zmienić listę `SEKCJE` w `src/schemas.py` — inaczej model będzie wypełniał pola pod starymi nagłówkami.
 
-| Stan | Znaczenie | Oznaczenie |
-|---|---|---|
-| `POTWIERDZONY` | zgodny z rejestrem WHO | ✅ |
-| `NIESPRAWDZANY` | ICD-10 i DSM-5 — rejestru nie pytaliśmy | • |
-| `NIEPOTWIERDZONY` | pytaliśmy i nie znaleziono | ❓ + ostrzeżenie |
+### Jak powstaje dokumentacja
 
-Dla ICD-11 kody przechodzą przez oficjalne API WHO:
+1. Model słucha nagrania i zwraca **ustrukturyzowaną odpowiedź**: transkrypcję, sekcje A–Q, osobny opis każdego leku (sekcja E), status bezpieczeństwa (sekcja J) i listę kwestii do sprawdzenia.
+2. Aplikacja składa z tego **jeden dokument tekstowy**, który lekarz poprawia w całości i zatwierdza.
+3. Zatwierdzony tekst trafia do bazy i staje się wzorcem stylu dla kolejnych wizyt tej osoby.
 
-1. model podaje przede wszystkim **nazwę rozpoznania**, a kod tylko gdy jest go pewien,
-2. aplikacja potwierdza kod w rejestrze i **zastępuje opis oficjalnym tytułem WHO**, więc para kod–opis nie może się rozjechać,
-3. gdy kodu brak lub nie istnieje — szuka po nazwie rozpoznania,
-4. czego nie da się potwierdzić, trafia do notatki oznaczone jako **niezweryfikowane**, także w tekście do skopiowania (`[DO WERYFIKACJI]`).
+Kilka decyzji, które nie są oczywiste z samego promptu:
 
-### Konfiguracja (5 min)
+- **Sekcja nieporuszona dostaje znacznik od aplikacji, nie od modelu.** Model zostawia ją pustą, aplikacja wpisuje „Nie poruszono podczas konsultacji.". Gdyby to model miał coś wpisać, kusiłoby go dopisanie „pacjent nie zgłasza…" — a brak rozmowy o objawie nie jest jego zaprzeczeniem.
+- **Wszystkie sekcje są w dokumencie, także puste.** Lekarz od razu widzi, czego wizyta nie objęła.
+- **Ryzyko samobójcze ma trzy stany:** zgłaszane / pacjent zaprzecza / **nie oceniano**. Pierwsza wersja aplikacji miała dwa i przy nieporuszonym temacie wpisywała „nieobecne" — w dokumentacji wyglądało to jak zaprzeczenie. Status lekarz potwierdza jawnie przy zatwierdzaniu.
+- **Fragment oznaczony jako pilny** (aktualne zagrożenie życia lub zdrowia) blokuje zatwierdzenie, dopóki lekarz nie potwierdzi, że go zweryfikował.
+- **Lista „do sprawdzenia przed zatwierdzeniem"** stoi nad dokumentem i do niego nie trafia — to zadania dla lekarza, nie treść dokumentacji medycznej.
+- **Transkrypcja nie trafia do dokumentu ani do wzorców stylu.** Jest dostępna obok, do porównania.
+- **Nieme nagranie jest ogłaszane na początku dokumentu.** Inaczej dokument z samymi „nie poruszono" czytałby się jak wizyta, na której nic nie omówiono.
 
-1. Załóż konto na https://icd.who.int/icdapi (darmowe).
-2. Zakładka **API Access Keys** → **Create new key**. Skopiuj `Client Id` i `Client Secret`.
-3. **Sprawdź klucze zanim wrzucisz je do aplikacji:**
-   ```bash
-   ICD_CLIENT_ID=... ICD_CLIENT_SECRET=... python3 scripts/test_icd.py
-   ```
-   Skrypt pobiera token, wyszukuje rozpoznanie w ICD-11 i sprawdza kilka konkretnych kodów w ICD-11 i ICD-10. Po każdym kroku pisze, co poszło nie tak — dzięki temu wiadomo, czy problem jest w kluczach, w sieci, czy w samym API.
-4. Gdy skrypt pokazuje same ✅, wpisz `ICD_CLIENT_ID` i `ICD_CLIENT_SECRET` do sekretów aplikacji i zrestartuj ją.
+### Czego aplikacja nie robi — celowo
 
-Bez tych kluczy aplikacja **działa normalnie**, ale każde rozpoznanie jest oznaczane jako niezweryfikowane — awaria API czy brak konfiguracji nigdy nie przerywa generowania notatki.
-
-⚠️ Weryfikacja potwierdza, że **kod istnieje i co oznacza**. Nie potwierdza, że rozpoznanie jest trafne klinicznie — to zawsze decyzja lekarza.
-
-### Wybór klasyfikacji: ICD-10, ICD-11, DSM-5
-
-Lekarz zaznacza jedną albo kilka naraz — przy kilku to samo rozpoznanie dostaje osobny wpis w każdym systemie, a widok i tekst do skopiowania grupują je po systemie.
-
-**DSM-5 działa inaczej i trzeba o tym wiedzieć.** Wydaje go Amerykańskie Towarzystwo Psychiatryczne, jest objęty prawem autorskim i **nie ma publicznego rejestru do odpytania** — odpowiednika API WHO po prostu nie ma. Dlatego rozpoznania DSM-5 **zawsze** wracają oznaczone do weryfikacji, niezależnie od tego, jak pewny jest model.
-
-Ponieważ DSM-5 posługuje się kodami ICD-10-CM, gdy model poda kod, robimy pomocniczą kontrolę w ICD-10 i dopisujemy jej wynik w uwadze („Kontrolnie: F41.1 w ICD-10 to…"). To wskazówka dla lekarza, **nie potwierdzenie** — ICD-10-CM to amerykańska modyfikacja i nie każdy jej kod istnieje w wersji WHO.
+Nie proponuje rozpoznań ani kodów ICD/DSM, nie dopisuje własnych sugestii terapeutycznych i nie przesądza o zwolnieniu lekarskim. Rozpoznanie, plan leczenia czy decyzja o zwolnieniu pojawiają się w dokumentacji wyłącznie wtedy, gdy wypowiedział je lekarz.
 
 ## Model i koszty
 
@@ -228,9 +216,18 @@ Trzy pokrętła zmieniasz w sekretach, bez ruszania kodu (wymagają restartu apl
 |---|---|---|
 | `GEMINI_MODEL` | `gemini-2.5-pro` | Zmiana modelu. Nieznany model jest wyceniany najdroższą znaną stawką i oznaczany w panelu. |
 | `GEMINI_THINKING_BUDGET` | `8192` | Tyle wynosi domyślna wartość Google dla 2.5 Pro. Niżej = taniej i gorzej; `-1` = model decyduje sam, ale koszt przestaje być przewidywalny. Pro nie umie wyłączyć myślenia — wartości poniżej 128 są podnoszone do 128. |
-| `FEW_SHOT_LIMIT` | `3` | Ile zatwierdzonych notatek trafia do promptu jako wzorzec stylu. `0` je wyłącza — użyj, gdyby model zaczął przenosić treść ze starych wizyt do nowej notatki. |
+| `FEW_SHOT_LIMIT` | `3` | Ile zatwierdzonych dokumentacji trafia do promptu jako wzorzec stylu. `0` je wyłącza — użyj, gdyby model zaczął przenosić treść ze starych wizyt do nowej dokumentacji. |
 
-Orientacyjny koszt wizyty 45-minutowej (~86 tys. tokenów audio): **2.5 Flash ≈ $0,10**, **2.5 Pro z myśleniem 8192 ≈ $0,23**. Tokeny myślenia są rozliczane jak wyjście, więc to one, a nie audio, odpowiadają za różnicę.
+Orientacyjny koszt i czas na **2.5 Pro z myśleniem 8192**, policzone modułem `src/pricing.py`:
+
+| Wizyta | Koszt | Tokeny wyjścia | Samo generowanie wyjścia |
+|---|---|---|---|
+| 20 min | ≈ $0,26 | ~19 tys. | ~2–4 min |
+| 45 min | ≈ $0,42 | ~29 tys. | ~3–6 min |
+
+**Rachunek i czas zależą głównie od wyjścia, nie od audio.** Na wyjście składają się trzy rzeczy: myślenie (8192), szczegółowa dokumentacja A–Q i — największa — **dosłowna transkrypcja**, którą model też pisze token po tokenie. Wcześniejszy szacunek ($0,23 za 45 minut) zakładał 2 500 tokenów wyjścia i był zaniżony, bo nie mieścił nawet transkrypcji.
+
+Jeśli czas generowania okaże się za długi, pierwszą dźwignią jest transkrypcja, a nie dokumentacja: można ją robić osobno, szybszym modelem i równolegle. Dokumentacji nie skracamy, bo prompt kliniczny stawia kompletność ponad zwięzłość. Aplikacja mierzy etapy generowania (widać je po każdej wizycie i w panelu właściciela), więc decyzja może opierać się na pomiarach.
 
 ⚠️ **Stawki w `src/pricing.py` pochodzą ze źródeł wtórnych i wymagają potwierdzenia** w konsoli Google Cloud. Cała tabela do poprawienia siedzi w jednym bloku na górze pliku; po sprawdzeniu ustaw tam `PRICES_ARE_PROVISIONAL = False`, żeby zniknęła informacja w panelu.
 
@@ -287,7 +284,7 @@ Vertex AI w Google Cloud nie wykorzystuje danych klienta do trenowania modeli pu
    """
    ```
    Potrójne cudzysłowy są obowiązkowe — JSON ma własne cudzysłowy i znaki nowej linii.
-7. **Reboot** apki. W Cloud Console → **Vertex AI → Metrics** powinieneś zobaczyć request po pierwszej generacji notatki (a NIE w „Generative Language API").
+7. **Reboot** apki. W Cloud Console → **Vertex AI → Metrics** powinieneś zobaczyć request po pierwszym przygotowaniu dokumentacji (a NIE w „Generative Language API").
 
 Stawki na Vertex AI bywają minimalnie inne niż na Gemini API; szacunek z `src/pricing.py` zostaje przybliżony.
 

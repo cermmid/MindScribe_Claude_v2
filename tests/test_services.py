@@ -1,9 +1,13 @@
-"""Testy reguł biznesowych wydzielonych ze stron Streamlita (faza A planu).
+"""Testy reguł dokumentacji: schemat, prompt, składanie tekstu, zatwierdzanie, odczyt.
 
-Chronią zachowanie, które wcześniej istniało wyłącznie w ciele stron Streamlita (dziś `views/`), i które łatwo zgubić przy przepisywaniu na FastAPI.
+Najważniejsze są te, które chronią pacjenta przed cichym błędem w dokumentacji:
+brak rozmowy o ryzyku nigdy nie staje się „zaprzecza", nieporuszony obszar jest
+oznaczony zamiast pominięty, a lista do weryfikacji i transkrypcja nie trafiają
+do tekstu, który lekarz wkleja do dokumentacji medycznej.
 """
 
 import io
+import json
 import wave
 from array import array
 
@@ -13,191 +17,346 @@ from pydantic import ValidationError
 from src.audio import looks_silent, resolve_audio_mime
 from src.config import _as_int, thinking_budget_for
 from src.formatting import (
+    J_NIE_OCENIANO,
+    NIE_PORUSZONO,
+    PILNE,
     audio_quality_label,
     audio_unusable,
-    classification_label,
-    classifications_of,
-    get_icd_codes,
-    group_codes_by_classification,
-    note_to_text,
+    draft_to_document,
+    risk_status,
+    with_header,
 )
 from src.pricing import estimate_audio_seconds, format_duration
 from src.prompts import SYSTEM_PROMPT, build_few_shot_block, build_user_prompt
-from src.schemas import VerifiedICDCode
+from src.schemas import SEKCJE, DokumentacjaDraft, Ryzyko
 from src.services import (
-    build_corrected_note,
-    clean_icd_rows,
-    count_distinct_diagnoses,
+    build_approved_documentation,
     derive_audio_suffix,
-    normalize_principal_diagnosis,
     resolve_note_version,
-    reuse_verification,
-    split_lines,
 )
 
 
-class TestEstimateAudioSeconds:
-    def test_estimates_from_audio_tokens(self):
-        """32 tokeny na sekundę: 57 600 tokenów to pół godziny."""
-        assert estimate_audio_seconds(57_600) == 1800.0
-
-    def test_none_when_no_data(self):
-        assert estimate_audio_seconds(0) is None
-        assert estimate_audio_seconds(None) is None
-
-    def test_none_when_modality_unknown(self):
-        """Bez rozbicia modalności liczba zawiera też prompt tekstowy — nie wolno zgadywać."""
-        assert estimate_audio_seconds(57_600, modality_known=False) is None
-
-    def test_none_below_trust_threshold(self):
-        """Krótkie nagranie: narzut tekstu promptu dominuje, więc lepiej nie pokazywać nic."""
-        assert estimate_audio_seconds(3_840) is None  # ~2 minuty
+def _draft(**overrides) -> dict:
+    """Szkic w takim kształcie, w jakim zapisuje go aplikacja (`model_dump(mode="json")`)."""
+    base = DokumentacjaDraft(
+        jakosc_nagrania="DOBRA",
+        raw_transcript="transkrypcja",
+        j_bezpieczenstwo={"status": "NIE_OCENIANO"},
+    ).model_dump(mode="json")
+    base.update(overrides)
+    return base
 
 
-class TestFormatDuration:
-    def test_minutes(self):
-        assert format_duration(840) == "14 min"
-
-    def test_hours_and_minutes(self):
-        assert format_duration(4980) == "1 h 23 min"
-
-    def test_missing(self):
-        assert format_duration(None) == "—"
-        assert format_duration(0) == "—"
+# --- Schemat ---------------------------------------------------------------------
 
 
-class TestDeriveAudioSuffix:
-    def test_takes_extension_from_filename(self):
-        assert derive_audio_suffix("wizyta.MP3") == ".mp3"
+class TestSchema:
+    def test_risk_has_three_states(self):
+        """Trzeci stan jest powodem zmiany: brak rozmowy o ryzyku to nie zaprzeczenie."""
+        assert {r.value for r in Ryzyko} == {"OBECNE", "ZAPRZECZA", "NIE_OCENIANO"}
 
-    def test_defaults_when_no_extension(self):
-        assert derive_audio_suffix("nagranie") == ".wav"
-
-    def test_defaults_when_no_filename(self):
-        # nagranie z mikrofonu nie ma nazwy pliku
-        assert derive_audio_suffix(None) == ".wav"
-
-
-class TestSplitLines:
-    def test_strips_and_drops_empties(self):
-        assert split_lines("  lęk \n\n  bezsenność  \n") == ["lęk", "bezsenność"]
-
-    def test_empty_input(self):
-        assert split_lines("") == []
-        assert split_lines(None) == []
-
-
-class TestCleanIcdRows:
-    def test_drops_only_completely_empty_rows(self):
-        """Zaślepka formularza znika, ale rozpoznanie bez kodu zostaje.
-
-        Pusty kod jest teraz poprawny — kod dobierze rejestr WHO na podstawie nazwy,
-        a to bezpieczniejsze niż kod zgadnięty przez model.
-        """
-        rows = [
-            {"code": "F32.1", "description": "Epizod", "confidence": 0.8},
-            {"code": "   ", "description": "  ", "confidence": 0.0},
-            {"code": "", "description": "Zaburzenie lękowe", "confidence": 0.5},
-        ]
-        result = clean_icd_rows(rows)
-        assert [(c.code, c.description) for c in result] == [
-            ("F32.1", "Epizod"),
-            ("", "Zaburzenie lękowe"),
-        ]
-
-    def test_confidence_none_becomes_zero(self):
-        result = clean_icd_rows([{"code": "F41.1", "confidence": None}])
-        assert result[0].confidence == 0.0
-
-    def test_confidence_nan_becomes_zero(self):
-        """st.data_editor potrafi zwrócić NaN dla pustej komórki liczbowej."""
-        result = clean_icd_rows([{"code": "F41.1", "confidence": float("nan")}])
-        assert result[0].confidence == 0.0
-
-    def test_confidence_garbage_becomes_zero(self):
-        result = clean_icd_rows([{"code": "F41.1", "confidence": "abc"}])
-        assert result[0].confidence == 0.0
-
-    def test_confidence_clamped_to_range(self):
-        """PsychiatricNote wymaga 0.0-1.0, więc wartość spoza zakresu nie może wysadzić walidacji."""
-        assert clean_icd_rows([{"code": "F1", "confidence": 5.0}])[0].confidence == 1.0
-        assert clean_icd_rows([{"code": "F2", "confidence": -3.0}])[0].confidence == 0.0
-
-    def test_missing_description_becomes_empty_string(self):
-        assert clean_icd_rows([{"code": "F41.1", "confidence": 0.5}])[0].description == ""
-
-    def test_keeps_english_search_term(self):
-        """Bez tego zatwierdzenie odpytywało rejestr WHO polską nazwą i gubiło ICD-11."""
-        row = {
-            "klasyfikacja": "ICD-11",
-            "code": "",
-            "description": "Zaburzenie lękowe uogólnione",
-            "termin_wyszukiwania": "Generalised anxiety disorder",
-            "confidence": 0.8,
-        }
-        assert clean_icd_rows(row for row in [row])[0].termin_wyszukiwania == (
-            "Generalised anxiety disorder"
+    def test_sections_default_to_empty(self):
+        """Puste sekcje są poprawną odpowiedzią — model nie musi niczego wypełniać."""
+        draft = DokumentacjaDraft(
+            jakosc_nagrania="DOBRA", raw_transcript="", j_bezpieczenstwo={"status": "NIE_OCENIANO"}
         )
+        assert draft.c_aktualne_objawy == ""
+        assert draft.e_leki == []
+        assert draft.do_weryfikacji == []
 
-    def test_missing_search_term_is_empty_not_none(self):
-        assert clean_icd_rows([{"code": "F41.1"}])[0].termin_wyszukiwania == ""
+    def test_transcript_is_generated_before_sections(self):
+        """Gemini generuje pola po kolei — sekcje mają powstawać z transkrypcją przed oczami."""
+        fields = list(DokumentacjaDraft.model_fields)
+        assert fields.index("raw_transcript") < fields.index("a_dane_ogolne")
+
+    def test_review_list_is_generated_last(self):
+        """Kontrola kompletności z punktu 6 ma nastąpić po napisaniu całości."""
+        assert list(DokumentacjaDraft.model_fields)[-1] == "do_weryfikacji"
+
+    def test_every_section_has_a_field(self):
+        fields = set(DokumentacjaDraft.model_fields)
+        assert all(field in fields for field, _ in SEKCJE)
+        assert [title[0] for _, title in SEKCJE] == list("ABCDEFGHIJKLMNOPQ")
+
+    def test_no_diagnosis_or_suggestion_fields(self):
+        """Prompt: „nie stawiaj rozpoznań, nie twórz planów leczenia"."""
+        fields = set(DokumentacjaDraft.model_fields)
+        assert not {f for f in fields if "icd" in f or "rozpozn" in f or "propon" in f}
 
 
-class TestBuildCorrectedNote:
-    def _valid_kwargs(self, **overrides):
-        base = dict(
-            raw_transcript="transkrypcja",
-            ryzyko_samobojcze="NIEOBECNE",
-            ryzyko_samobojcze_opis="  pacjent neguje  ",
-            status_psychiczny="w kontakcie logicznym",
-            objawy=["lęk", "  ", "bezsenność"],
-            kody_icd=[{"code": "F41.1", "description": "Lęk", "confidence": 0.7}],
-            zalecenia_terapeuty=["sertralina"],
-            podsumowanie="wizyta kontrolna",
+# --- Prompt ----------------------------------------------------------------------
+
+
+class TestPrompt:
+    def test_clinical_prompt_is_loaded_verbatim(self):
+        """Treść lekarza trafia do modelu w całości — zasada nadrzędna i zasada końcowa."""
+        assert "nie skracaj wywiadu kosztem informacji klinicznie istotnych" in SYSTEM_PROMPT
+        assert "Nie stawiaj samodzielnie rozpoznań" in SYSTEM_PROMPT
+        assert "Brak danych nie oznacza zaprzeczenia objawom" in SYSTEM_PROMPT
+
+    def test_technical_rules_forbid_denial_without_question(self):
+        assert "Wybierz ZAPRZECZA wyłącznie" in SYSTEM_PROMPT
+        assert "NIE_OCENIANO" in SYSTEM_PROMPT
+
+    def test_silent_recording_rule_is_present(self):
+        assert "BRAK_MOWY" in SYSTEM_PROMPT
+
+    def test_prompt_file_has_no_invisible_characters(self):
+        """Wklejony tekst miał miękki dzielnik w słowie „Dawkę" — niewidoczny, ale w tokenach."""
+        assert "­" not in SYSTEM_PROMPT
+
+    def test_visit_type_reaches_the_model(self):
+        assert "Pierwsza wizyta" in build_user_prompt([], visit_type="Pierwsza")
+        assert "Wizyta kolejna" in build_user_prompt([], visit_type="Kolejna")
+
+
+class TestFewShot:
+    def _approved(self, dokument: str) -> dict:
+        return {"note_json": json.dumps({"dokument": dokument, "ryzyko": "ZAPRZECZA"})}
+
+    def test_uses_approved_document(self):
+        block = build_few_shot_block([self._approved("Pacjent zgłasza trudności ze snem.")])
+        assert "Pacjent zgłasza trudności ze snem." in block
+
+    def test_transcript_never_reaches_the_prompt(self):
+        example = self._approved("Dokument.") | {"raw_transcript": "TAJNA ROZMOWA"}
+        assert "TAJNA ROZMOWA" not in build_few_shot_block([example])
+
+    def test_unreadable_or_foreign_format_is_skipped(self):
+        """Zapis w innym formacie nie może wejść do promptu jako pusty albo surowy JSON."""
+        examples = [{"note_json": "{zły json"}, {"note_json": json.dumps({"podsumowanie": "x"})}]
+        assert build_few_shot_block(examples) == ""
+
+    def test_no_examples_no_block(self):
+        assert build_few_shot_block([]) == ""
+
+
+# --- Składanie dokumentu -----------------------------------------------------------
+
+
+class TestDraftToDocument:
+    def test_all_sections_in_order(self):
+        doc = draft_to_document(_draft())
+        positions = [doc.index(title) for _, title in SEKCJE]
+        assert positions == sorted(positions)
+
+    def test_empty_section_is_marked_not_skipped(self):
+        """Lekarz ma widzieć, które obszary wizyta pominęła — to kontrola kompletności."""
+        doc = draft_to_document(_draft())
+        block = doc.split("K. Objawy psychotyczne")[1].split("L. Inne")[0]
+        assert NIE_PORUSZONO in block
+
+    def test_section_content_is_kept(self):
+        doc = draft_to_document(_draft(c_aktualne_objawy="Pacjent opisuje trudności z zasypianiem."))
+        assert "Pacjent opisuje trudności z zasypianiem." in doc
+
+    def test_unassessed_risk_never_reads_as_denial(self):
+        """Główny powód zmiany: brak rozmowy o ryzyku nie może wyglądać jak „bez myśli s."."""
+        doc = draft_to_document(_draft(j_bezpieczenstwo={"status": "NIE_OCENIANO", "opis": ""}))
+        assert J_NIE_OCENIANO in doc
+        assert "zaprzecza" not in doc.lower()
+
+    def test_missing_risk_section_defaults_to_unassessed(self):
+        """Uszkodzony albo niekompletny zapis nie może dać „zaprzecza" przez przypadek."""
+        assert risk_status({}) == "NIE_OCENIANO"
+        assert risk_status({"j_bezpieczenstwo": {"status": "COS"}}) == "NIE_OCENIANO"
+
+    def test_denial_is_stated_when_discussed(self):
+        doc = draft_to_document(
+            _draft(j_bezpieczenstwo={"status": "ZAPRZECZA", "opis": "Pacjent zaprzecza myślom rezygnacyjnym."})
         )
-        base.update(overrides)
-        return base
+        assert "pacjent zaprzecza" in doc
+        assert "Pacjent zaprzecza myślom rezygnacyjnym." in doc
 
-    def test_builds_valid_note(self):
-        note = build_corrected_note(**self._valid_kwargs())
-        assert note.ryzyko_samobojcze.value == "NIEOBECNE"
-        assert note.kody_icd[0].code == "F41.1"
+    def test_urgent_flag_is_visible_in_the_document(self):
+        doc = draft_to_document(
+            _draft(j_bezpieczenstwo={"status": "OBECNE", "opis": "Plan i dostęp do środków.", "pilne": True})
+        )
+        assert PILNE in doc
 
-    def test_classification_is_recorded(self):
-        note = build_corrected_note(**self._valid_kwargs(klasyfikacje=["ICD-11"]))
-        assert [k.value for k in note.klasyfikacje] == ["ICD-11"]
-
-    def test_rejects_unknown_classification(self):
-        with pytest.raises(ValueError):
-            build_corrected_note(**self._valid_kwargs(klasyfikacje=["ICD-9"]))
-
-    def test_drops_blank_symptoms(self):
-        note = build_corrected_note(**self._valid_kwargs())
-        assert note.objawy == ["lęk", "bezsenność"]
-
-    def test_strips_risk_description(self):
-        note = build_corrected_note(**self._valid_kwargs())
-        assert note.ryzyko_samobojcze_opis == "pacjent neguje"
-
-    def test_drops_blank_icd_codes(self):
-        note = build_corrected_note(
-            **self._valid_kwargs(
-                kody_icd=[
-                    {"code": "F32.1", "confidence": 0.9},
-                    {"code": "", "confidence": 0.0},
+    def test_each_medication_gets_its_own_entry(self):
+        doc = draft_to_document(
+            _draft(
+                e_leki=[
+                    {"nazwa": "sertralina", "opis": "50 mg, bez poprawy po 6 tygodniach."},
+                    {"nazwa": "kwetiapina (nazwa niepewna)", "opis": "Na sen, odstawiona samodzielnie."},
                 ]
             )
         )
-        assert len(note.kody_icd) == 1
+        assert "1. sertralina\n50 mg, bez poprawy po 6 tygodniach." in doc
+        assert "2. kwetiapina (nazwa niepewna)" in doc
 
-    def test_invalid_risk_value_raises(self):
-        """Nieprawidłowa wartość ryzyka musi wysadzić budowanie — nie wolno zapisać takiej notatki."""
-        with pytest.raises(ValueError):
-            build_corrected_note(**self._valid_kwargs(ryzyko_samobojcze="MOŻE"))
+    def test_review_list_stays_out_of_the_document(self):
+        """To zadania dla lekarza, nie treść dokumentacji medycznej."""
+        doc = draft_to_document(_draft(do_weryfikacji=["Dawka sertraliny niejasna (sekcja E)."]))
+        assert "Dawka sertraliny niejasna" not in doc
 
-    def test_missing_required_field_raises(self):
+    def test_transcript_stays_out_of_the_document(self):
+        doc = draft_to_document(_draft(raw_transcript="PEŁNY ZAPIS ROZMOWY"))
+        assert "PEŁNY ZAPIS ROZMOWY" not in doc
+
+    def test_failed_recording_is_announced_first(self):
+        """Inaczej nieme nagranie wygląda jak wizyta, na której niczego nie omówiono."""
+        doc = draft_to_document(_draft(jakosc_nagrania="BRAK_MOWY", raw_transcript=""))
+        assert doc.startswith("!! UWAGA")
+
+    def test_header_comes_from_the_record(self):
+        text = with_header(
+            "A. Treść\n", title="Wizyta #3", visit_type="Kolejna", created_at="2026-10-23T10:00:00",
+            doctor_name="dr Nowak",
+        )
+        assert text.startswith("Wizyta #3\nWizyta kolejna · Data: 2026-10-23 · Prowadzący: dr Nowak")
+        assert text.rstrip().endswith("A. Treść")
+
+
+# --- Zatwierdzanie -----------------------------------------------------------------
+
+
+class TestApprovedDocumentation:
+    def test_valid_document_is_accepted(self):
+        approved = build_approved_documentation(dokument="  Treść  ", ryzyko="ZAPRZECZA")
+        assert approved.dokument == "Treść"
+        assert approved.ryzyko is Ryzyko.ZAPRZECZA
+
+    def test_empty_document_is_rejected(self):
+        """Zatwierdzona dokumentacja uczy model stylu — pusta nauczyłaby pustych odpowiedzi."""
         with pytest.raises(ValidationError):
-            build_corrected_note(**self._valid_kwargs(status_psychiczny=None))
+            build_approved_documentation(dokument="   \n ", ryzyko="ZAPRZECZA")
+
+    def test_unknown_risk_value_is_rejected(self):
+        with pytest.raises(ValueError):
+            build_approved_documentation(dokument="Treść", ryzyko="NIEOBECNE")
+
+
+class TestApproveFailsLoudly:
+    """Zatwierdzenie, które niczego nie zmieniło, nie może meldować sukcesu."""
+
+    def _approved(self):
+        return build_approved_documentation(dokument="Treść dokumentacji.", ryzyko="NIE_OCENIANO")
+
+    def _insert(self, temp_db, owner: str) -> int:
+        return temp_db.insert_visit(
+            audio_path=None,
+            pipeline="multimodal",
+            raw_transcript="t",
+            ai_note_original_json="{}",
+            doctor_id=owner,
+        )
+
+    def test_raises_when_visit_does_not_exist(self, temp_db):
+        from src.services import VisitNotUpdated, approve_documentation
+
+        with pytest.raises(VisitNotUpdated):
+            approve_documentation(999_999, self._approved(), doctor_id="user-a")
+
+    def test_raises_when_visit_belongs_to_someone_else(self, temp_db):
+        from src.services import VisitNotUpdated, approve_documentation
+
+        visit_id = self._insert(temp_db, "user-b")
+        with pytest.raises(VisitNotUpdated):
+            approve_documentation(visit_id, self._approved(), doctor_id="user-a")
+
+    def test_succeeds_and_feeds_few_shot(self, temp_db):
+        from src.services import approve_documentation, load_few_shot_examples
+
+        visit_id = self._insert(temp_db, "user-a")
+        approve_documentation(visit_id, self._approved(), doctor_id="user-a")
+        assert temp_db.get_visit(visit_id, doctor_id="user-a")["status"] == "approved"
+        assert "Treść dokumentacji." in build_few_shot_block(load_few_shot_examples("user-a"))
+
+    def test_few_shot_never_carries_transcripts(self, temp_db):
+        """Transkrypcji nie pobieramy z bazy wcale, skoro nie trafia do promptu."""
+        from src.services import approve_documentation, load_few_shot_examples
+
+        visit_id = self._insert(temp_db, "user-a")
+        approve_documentation(visit_id, self._approved(), doctor_id="user-a")
+        assert all("raw_transcript" not in ex for ex in load_few_shot_examples("user-a"))
+
+
+# --- Odczyt ----------------------------------------------------------------------
+
+
+class TestResolveNoteVersion:
+    def test_approved_document_wins(self):
+        visit = {
+            "ai_note_original_json": json.dumps(_draft(c_aktualne_objawy="wersja asystenta")),
+            "doctor_note_corrected_json": json.dumps({"dokument": "wersja lekarza", "ryzyko": "OBECNE"}),
+        }
+        resolved = resolve_note_version(visit)
+        assert resolved.is_approved is True
+        assert resolved.document.strip() == "wersja lekarza"
+        assert resolved.ryzyko == "OBECNE"
+
+    def test_falls_back_to_rendered_draft(self):
+        visit = {"ai_note_original_json": json.dumps(_draft(c_aktualne_objawy="wersja asystenta"))}
+        resolved = resolve_note_version(visit)
+        assert resolved.is_approved is False
+        assert "wersja asystenta" in resolved.document
+
+    def test_foreign_format_is_shown_raw_not_as_empty(self):
+        """Zapis spoza tego schematu nie może udawać pustej dokumentacji."""
+        visit = {"ai_note_original_json": json.dumps({"podsumowanie": "stary format"})}
+        resolved = resolve_note_version(visit)
+        assert resolved.document is None
+        assert "stary format" in resolved.source_json
+
+    def test_broken_json_does_not_raise(self):
+        resolved = resolve_note_version({"ai_note_original_json": "{to nie jest json"})
+        assert resolved.document is None
+        assert resolved.source_json == "{to nie jest json"
+
+    def test_no_note_at_all(self):
+        resolved = resolve_note_version({})
+        assert resolved.document is None
+        assert resolved.source_json is None
+
+
+# --- Widok: escapowanie i podział na sekcje ------------------------------------------
+
+
+class TestDocumentView:
+    def test_clinical_text_is_not_turned_into_markdown(self):
+        """Gwiazdka w wypowiedzi pacjenta nie może zamienić się w pogrubienie."""
+        from src.ui import _escape
+
+        assert _escape("*bardzo* źle") == r"\*bardzo\* źle"
+
+    def test_line_breaks_survive(self):
+        from src.ui import _escape
+
+        assert "  \n" in _escape("linia pierwsza\nlinia druga")
+
+    def test_splits_on_section_headings(self):
+        from src.ui import _split_sections
+
+        doc = draft_to_document(_draft(c_aktualne_objawy="Objawy."))
+        titles = [title for title, _ in _split_sections(doc) if title]
+        assert titles == [title for _, title in SEKCJE]
+
+    def test_edited_headings_do_not_lose_content(self):
+        """Lekarz mógł przeredagować nagłówki — wtedy treść ma zostać, choć bez podziału."""
+        from src.ui import _split_sections
+
+        sections = _split_sections("Moje własne nagłówki\nTreść wizyty.")
+        assert sections == [(None, "Moje własne nagłówki\nTreść wizyty.")]
+
+
+# --- Audio, konfiguracja, czas ------------------------------------------------------
+
+
+class TestAudioQualityFlags:
+    def test_flags_unusable_recording(self):
+        draft = {"jakosc_nagrania": "BRAK_MOWY"}
+        assert audio_unusable(draft) is True
+        assert "nie wykryto zrozumiałej mowy" in audio_quality_label(draft)
+
+    def test_flags_poor_recording_without_marking_unusable(self):
+        draft = {"jakosc_nagrania": "SLABA"}
+        assert audio_unusable(draft) is False
+        assert audio_quality_label(draft) is not None
+
+    def test_good_recording_has_no_warning(self):
+        assert audio_quality_label({"jakosc_nagrania": "DOBRA"}) is None
 
 
 def _wav_bytes(samples: list[int], *, framerate: int = 16000) -> bytes:
@@ -241,17 +400,15 @@ class TestLooksSilent:
 
 
 class TestResolveAudioMime:
-    """Najważniejsza poprawka: zły typ MIME sprawiał, że model zmyślał transkrypcję."""
+    """Zły typ MIME sprawiał, że model zmyślał transkrypcję."""
 
     def test_browser_mime_wins_over_extension(self):
-        """st.audio_input zapisuje jako .wav, ale przeglądarka może nagrać webm."""
         assert resolve_audio_mime(".wav", "audio/webm") == "audio/webm"
 
     def test_strips_codec_parameters(self):
         assert resolve_audio_mime(".wav", "audio/webm;codecs=opus") == "audio/webm"
 
     def test_accepts_video_container_for_audio_only_recording(self):
-        """Przeglądarki potrafią zwrócić video/webm dla nagrania z samym dźwiękiem."""
         assert resolve_audio_mime(".webm", "video/webm") == "video/webm"
 
     def test_falls_back_to_extension(self):
@@ -266,191 +423,15 @@ class TestResolveAudioMime:
         assert resolve_audio_mime(None, None) == "audio/wav"
 
 
-class TestBackwardCompatibility:
-    """Notatki zapisane przed dodaniem wyboru ICD-11 muszą dalej się otwierać."""
+class TestDeriveAudioSuffix:
+    def test_takes_extension_from_filename(self):
+        assert derive_audio_suffix("wizyta.MP3") == ".mp3"
 
-    def test_reads_legacy_icd_key(self):
-        legacy = {"kody_icd10": [{"code": "F32.1", "description": "Epizod", "confidence": 0.8}]}
-        assert get_icd_codes(legacy)[0]["code"] == "F32.1"
+    def test_defaults_when_no_extension(self):
+        assert derive_audio_suffix("nagranie") == ".wav"
 
-    def test_reads_new_icd_key(self):
-        current = {"kody_icd": [{"code": "6A70.1", "description": "Epizod", "confidence": 0.8}]}
-        assert get_icd_codes(current)[0]["code"] == "6A70.1"
-
-    def test_no_codes_at_all(self):
-        assert get_icd_codes({}) == []
-
-    def test_legacy_note_defaults_to_icd10(self):
-        """Notatka bez pola klasyfikacji powstała, gdy istniało tylko ICD-10."""
-        assert classification_label({}) == "ICD-10"
-
-    def test_reads_legacy_single_classification(self):
-        """Notatki sprzed wyboru wielu systemów mają pojedyncze `klasyfikacja`."""
-        assert classification_label({"klasyfikacja": "ICD-11"}) == "ICD-11"
-
-    def test_reads_multiple_classifications(self):
-        note = {"klasyfikacje": ["ICD-10", "DSM-5"]}
-        assert classifications_of(note) == ["ICD-10", "DSM-5"]
-        assert classification_label(note) == "ICD-10 + DSM-5"
-
-
-class TestApproveNoteFailsLoudly:
-    """Zatwierdzenie, które niczego nie zmieniło, nie może meldować sukcesu."""
-
-    def _note(self):
-        return build_corrected_note(
-            raw_transcript="t",
-            ryzyko_samobojcze="NIEOBECNE",
-            status_psychiczny="ok",
-            objawy=[],
-            kody_icd=[],
-            zalecenia_terapeuty=[],
-            podsumowanie="p",
-        )
-
-    def test_raises_when_visit_does_not_exist(self, temp_db):
-        from src.services import VisitNotUpdated, approve_note
-
-        with pytest.raises(VisitNotUpdated):
-            approve_note(999_999, self._note(), doctor_id="user-a")
-
-    def test_raises_when_visit_belongs_to_someone_else(self, temp_db):
-        from src.services import VisitNotUpdated, approve_note
-
-        visit_id = temp_db.insert_visit(
-            audio_path=None,
-            pipeline="multimodal",
-            raw_transcript="t",
-            ai_note_original_json="{}",
-            doctor_id="user-b",
-        )
-        with pytest.raises(VisitNotUpdated):
-            approve_note(visit_id, self._note(), doctor_id="user-a")
-
-    def test_succeeds_for_own_visit(self, temp_db):
-        from src.services import approve_note
-
-        visit_id = temp_db.insert_visit(
-            audio_path=None,
-            pipeline="multimodal",
-            raw_transcript="t",
-            ai_note_original_json="{}",
-            doctor_id="user-a",
-        )
-        approve_note(visit_id, self._note(), doctor_id="user-a")
-        assert temp_db.get_visit(visit_id, doctor_id="user-a")["status"] == "approved"
-
-
-class TestPromptCodeRequirement:
-    """Kod wolno pominąć tylko tam, gdzie aplikacja sama go dobierze z rejestru.
-
-    Regresja, którą to zamyka: prompt mówił „zostaw kod pusty, rejestr go ustali",
-    a po wyłączeniu odpytywania dla ICD-10 nie było już kto miał go uzupełnić —
-    notatki wracały z nazwami rozpoznań, ale bez kodów.
-    """
-
-    def test_icd10_code_is_demanded(self):
-        prompt = build_user_prompt([], klasyfikacje=["ICD-10"], lookup_systems=["ICD-11"])
-        assert "ICD-10 pole `code` jest **OBOWIĄZKOWE**" in prompt
-        assert "możesz zostawić PUSTE" not in prompt
-
-    def test_looked_up_system_demands_a_code_too(self):
-        """Pusty kod to wpis bezużyteczny, gdy rejestr zawiedzie — model ma podać swój."""
-        prompt = build_user_prompt([], klasyfikacje=["ICD-11"], lookup_systems=["ICD-11"])
-        assert "ICD-11 pole `code` jest **OBOWIĄZKOWE**" in prompt
-        # Niepewność ma iść w `confidence`, nie w puste pole — inaczej model wybiera
-        # pustkę zawsze, bo jest bezpieczna dla niego i bezużyteczna dla lekarza.
-        assert "confidence" in prompt
-        assert "zostaw pole puste" not in prompt
-
-    def test_english_term_demanded_for_looked_up_systems(self):
-        """Rejestr WHO nie zna polskich nazw — bez angielskiego terminu nic nie znajdziemy."""
-        prompt = build_user_prompt([], klasyfikacje=["ICD-11"], lookup_systems=["ICD-11"])
-        assert "`termin_wyszukiwania` jest **OBOWIĄZKOWE**" in prompt
-        assert "PO ANGIELSKU" in prompt
-
-    def test_no_english_term_demanded_when_nothing_is_looked_up(self):
-        prompt = build_user_prompt([], klasyfikacje=["ICD-10"], lookup_systems=["ICD-11"])
-        assert "termin_wyszukiwania" not in prompt
-
-    def test_description_is_always_polish(self):
-        """Nazwy DSM-5 są angielskie — mają zostać przetłumaczone, nie przepisane."""
-        prompt = build_user_prompt([], klasyfikacje=["DSM-5"], lookup_systems=["ICD-11"])
-        assert "PO POLSKU" in prompt
-        assert "przetłumacz je na polski" in prompt
-
-    def test_mixed_request_states_both_rules(self):
-        prompt = build_user_prompt(
-            [], klasyfikacje=["ICD-10", "ICD-11"], lookup_systems=["ICD-11"]
-        )
-        assert "ICD-10 pole `code` jest **OBOWIĄZKOWE**" in prompt
-        assert "ICD-11 pole `code` jest **OBOWIĄZKOWE**" in prompt
-
-    def test_icd10_switches_rule_when_lookup_enabled(self):
-        """Po włączeniu VERIFY_ICD10 ICD-10 przechodzi pod regułę klasyfikacji sprawdzanych."""
-        prompt = build_user_prompt(
-            [], klasyfikacje=["ICD-10"], lookup_systems=["ICD-11", "ICD-10"]
-        )
-        assert "ICD-10 pole `code` jest **OBOWIĄZKOWE** dokładnie tak samo" in prompt
-        assert "`termin_wyszukiwania` jest **OBOWIĄZKOWE**" in prompt
-
-
-class TestSymptomsPresentVsAbsent:
-    """Zgłoszony błąd: model opisywał jako obecne objawy, którym pacjent zaprzeczył."""
-
-    def _note(self, **overrides):
-        base = dict(
-            raw_transcript="t",
-            ryzyko_samobojcze="NIEOBECNE",
-            status_psychiczny="ok",
-            objawy=[],
-            kody_icd=[],
-            zalecenia_terapeuty=[],
-            podsumowanie="p",
-        )
-        base.update(overrides)
-        return build_corrected_note(**base)
-
-    def test_absent_symptoms_are_kept_separately(self):
-        note = self._note(
-            objawy=["obniżony nastrój"],
-            objawy_nieobecne=["myśli rezygnacyjne - neguje", "bezsenność - ustąpiła"],
-        )
-        assert note.objawy == ["obniżony nastrój"]
-        assert note.objawy_nieobecne == [
-            "myśli rezygnacyjne - neguje",
-            "bezsenność - ustąpiła",
-        ]
-
-    def test_defaults_to_empty(self):
-        assert self._note(objawy=["lęk"]).objawy_nieobecne == []
-
-    def test_blank_lines_are_dropped(self):
-        assert self._note(objawy_nieobecne=["", "  ", "neguje lęk"]).objawy_nieobecne == [
-            "neguje lęk"
-        ]
-
-    def test_prompt_demands_the_distinction(self):
-        assert "`objawy_nieobecne`" in SYSTEM_PROMPT
-        assert "ZAPRZECZYŁ" in SYSTEM_PROMPT
-        assert "USTĄPIŁ" in SYSTEM_PROMPT
-
-    def test_copyable_text_separates_the_two_lists(self):
-        note = {
-            "ryzyko_samobojcze": "NIEOBECNE",
-            "objawy": ["obniżony nastrój"],
-            "objawy_nieobecne": ["myśli rezygnacyjne - neguje"],
-        }
-        text = note_to_text(note, title="Wizyta #1")
-        assert "OBJAWY\n- obniżony nastrój" in text
-        assert "OBJAWY NIEOBECNE (zanegowane lub ustąpiłe)" in text
-        assert text.index("OBJAWY\n") < text.index("OBJAWY NIEOBECNE")
-
-    def test_section_absent_when_empty(self):
-        text = note_to_text(
-            {"ryzyko_samobojcze": "NIEOBECNE", "objawy": ["lęk"]}, title="W"
-        )
-        assert "OBJAWY NIEOBECNE" not in text
+    def test_defaults_when_no_filename(self):
+        assert derive_audio_suffix(None) == ".wav"
 
 
 class TestThinkingBudget:
@@ -484,400 +465,29 @@ class TestIntConfigParsing:
         assert _as_int("-1", 8192) == -1
 
 
-class TestMedications:
-    """Leki to ordynacja lekarska — pole wypełnia specjalista, nie asystent."""
+class TestEstimateAudioSeconds:
+    def test_estimates_from_audio_tokens(self):
+        """32 tokeny na sekundę: 57 600 tokenów to pół godziny."""
+        assert estimate_audio_seconds(57_600) == 1800.0
 
-    def _note(self, **overrides):
-        base = dict(
-            raw_transcript="t",
-            ryzyko_samobojcze="NIEOBECNE",
-            status_psychiczny="ok",
-            objawy=[],
-            kody_icd=[],
-            zalecenia_terapeuty=[],
-            podsumowanie="p",
-        )
-        base.update(overrides)
-        return build_corrected_note(**base)
+    def test_none_when_no_data(self):
+        assert estimate_audio_seconds(0) is None
+        assert estimate_audio_seconds(None) is None
 
-    def test_medications_are_kept(self):
-        note = self._note(leki=["sertralina 50 mg rano", "hydroksyzyna 10 mg doraźnie"])
-        assert note.leki == ["sertralina 50 mg rano", "hydroksyzyna 10 mg doraźnie"]
+    def test_none_when_modality_unknown(self):
+        assert estimate_audio_seconds(57_600, modality_known=False) is None
 
-    def test_empty_when_nothing_was_prescribed(self):
-        """Brak leków na wizycie ma zostać pustą listą, a nie czymkolwiek innym."""
-        assert self._note().leki == []
-
-    def test_blank_lines_are_dropped(self):
-        assert self._note(leki=["  ", "sertralina 50 mg", ""]).leki == ["sertralina 50 mg"]
-
-    def test_prompt_forbids_proposing_medications(self):
-        """Najgroźniejszy tryb porażki: model dopisuje 'typową' dawkę do rozpoznania."""
-        assert "`leki`" in SYSTEM_PROMPT
-        assert "zostaw listę PUSTĄ" in SYSTEM_PROMPT
-        assert "nie uzupełniasz" in SYSTEM_PROMPT
-
-    def test_copyable_text_separates_medications_from_proposals(self):
-        note = {
-            "ryzyko_samobojcze": "NIEOBECNE",
-            "zalecenia_terapeuty": ["kontrola za 4 tygodnie"],
-            "leki": ["sertralina 50 mg rano"],
-            "zalecenia_proponowane": ["rozważyć CBT"],
-        }
-        text = note_to_text(note, title="Wizyta #1")
-        assert "LEKI\n- sertralina 50 mg rano" in text
-        # Ordynacja nie może sąsiadować z tym, co wymyślił asystent.
-        assert text.index("LEKI") < text.index("PROPOZYCJE")
-
-    def test_medication_section_absent_when_empty(self):
-        text = note_to_text({"ryzyko_samobojcze": "NIEOBECNE", "leki": []}, title="W")
-        assert "LEKI" not in text
+    def test_none_below_trust_threshold(self):
+        assert estimate_audio_seconds(3_840) is None  # ~2 minuty
 
 
-class TestSplitRecommendations:
-    """Zalecenia z wizyty muszą być oddzielone od propozycji asystenta."""
+class TestFormatDuration:
+    def test_minutes(self):
+        assert format_duration(840) == "14 min"
 
-    def test_keeps_both_lists_separate(self):
-        note = build_corrected_note(
-            raw_transcript="t",
-            ryzyko_samobojcze="NIEOBECNE",
-            status_psychiczny="ok",
-            objawy=[],
-            kody_icd=[],
-            zalecenia_terapeuty=["sertralina 50 mg"],
-            zalecenia_proponowane=["rozważyć psychoterapię CBT"],
-            podsumowanie="p",
-        )
-        assert note.zalecenia_terapeuty == ["sertralina 50 mg"]
-        assert note.zalecenia_proponowane == ["rozważyć psychoterapię CBT"]
+    def test_hours_and_minutes(self):
+        assert format_duration(4980) == "1 h 23 min"
 
-    def test_copyable_text_marks_proposals_as_not_said(self):
-        note = {
-            "ryzyko_samobojcze": "NIEOBECNE",
-            "zalecenia_terapeuty": ["sertralina 50 mg"],
-            "zalecenia_proponowane": ["rozważyć CBT"],
-        }
-        text = note_to_text(note, title="Wizyta #1")
-        assert "ZALECENIA\n- sertralina 50 mg" in text
-        assert "PROPOZYCJE DO ROZWAŻENIA" in text
-        assert "nie padły na wizycie" in text
-        # kolejność: najpierw to, co faktycznie zalecono
-        assert text.index("ZALECENIA\n") < text.index("PROPOZYCJE")
-
-    def test_legacy_note_recommendations_still_render(self):
-        """Notatki sprzed podziału mają jedno pole `zalecenia`."""
-        note = {"ryzyko_samobojcze": "NIEOBECNE", "zalecenia": ["stara pozycja"]}
-        text = note_to_text(note, title="Wizyta #1")
-        assert "ZALECENIA\n- stara pozycja" in text
-        assert "PROPOZYCJE DO ROZWAŻENIA" not in text
-
-
-class TestGroupCodesByClassification:
-    def test_groups_in_requested_order(self):
-        note = {
-            "klasyfikacje": ["ICD-10", "DSM-5"],
-            "kody_icd": [
-                {"klasyfikacja": "DSM-5", "code": "300.02", "description": "GAD"},
-                {"klasyfikacja": "ICD-10", "code": "F41.1", "description": "Lęk uogólniony"},
-            ],
-        }
-        grouped = group_codes_by_classification(note)
-        assert list(grouped) == ["ICD-10", "DSM-5"]
-        assert grouped["ICD-10"][0]["code"] == "F41.1"
-        assert grouped["DSM-5"][0]["code"] == "300.02"
-
-    def test_codes_without_system_fall_into_first_classification(self):
-        note = {"klasyfikacje": ["ICD-11"], "kody_icd": [{"code": "6B00", "description": "GAD"}]}
-        assert list(group_codes_by_classification(note)) == ["ICD-11"]
-
-    def test_legacy_note_groups_under_icd10(self):
-        note = {"kody_icd10": [{"code": "F41.1", "description": "Lęk"}]}
-        assert list(group_codes_by_classification(note)) == ["ICD-10"]
-
-    def test_copyable_text_separates_systems(self):
-        """Lekarz wkleja ten tekst do dokumentacji — systemy nie mogą się zlewać."""
-        note = {
-            "ryzyko_samobojcze": "NIEOBECNE",
-            "klasyfikacje": ["ICD-10", "DSM-5"],
-            "kody_icd": [
-                {"klasyfikacja": "ICD-10", "code": "F41.1", "description": "Lęk", "zweryfikowany": True},
-                {"klasyfikacja": "DSM-5", "code": "300.02", "description": "GAD", "zweryfikowany": False},
-            ],
-        }
-        text = note_to_text(note, title="Wizyta #1")
-        assert "ROZPOZNANIA (ICD-10)" in text
-        assert "ROZPOZNANIA (DSM-5)" in text
-        # tylko DSM-5 jest niepotwierdzony
-        assert "300.02 — GAD" in text
-        assert "[NIEPOTWIERDZONY]" in text.split("ROZPOZNANIA (DSM-5)")[1]
-        # ICD-10 ma `zweryfikowany: True`, więc trafia w gałąź zgodności ze starymi notatkami
-        icd10_block = text.split("ROZPOZNANIA (ICD-10)")[1].split("ROZPOZNANIA (DSM-5)")[0]
-        assert "F41.1 — Lęk" in icd10_block
-        assert "[POTWIERDZONY]" in icd10_block
-
-    def test_legacy_note_has_no_audio_warning(self):
-        """Stare notatki nie mają pola jakości — nie wolno straszyć fałszywym alarmem."""
-        assert audio_unusable({}) is False
-        assert audio_quality_label({}) is None
-
-
-class TestAudioQualityFlags:
-    def test_flags_unusable_recording(self):
-        note = {"jakosc_nagrania": "BRAK_MOWY"}
-        assert audio_unusable(note) is True
-        assert "nie wykryto zrozumiałej mowy" in audio_quality_label(note)
-
-    def test_flags_poor_recording_without_marking_unusable(self):
-        note = {"jakosc_nagrania": "SLABA"}
-        assert audio_unusable(note) is False
-        assert audio_quality_label(note) is not None
-
-    def test_good_recording_has_no_warning(self):
-        assert audio_quality_label({"jakosc_nagrania": "DOBRA"}) is None
-
-    def test_warning_appears_in_copyable_text(self):
-        """Ostrzeżenie musi trafić też do tekstu, który lekarz wkleja do dokumentacji."""
-        note = {
-            "jakosc_nagrania": "BRAK_MOWY",
-            "ryzyko_samobojcze": "NIEOBECNE",
-            "podsumowanie": "brak danych",
-        }
-        text = note_to_text(note, title="Wizyta #1")
-        assert "UWAGA" in text
-        # ostrzeżenie przed treścią notatki
-        assert text.index("UWAGA") < text.index("MYŚLI SAMOBÓJCZE")
-
-
-class TestResolveNoteVersion:
-    def test_prefers_doctor_corrected_version(self):
-        visit = {
-            "ai_note_original_json": '{"podsumowanie": "wersja AI"}',
-            "doctor_note_corrected_json": '{"podsumowanie": "wersja lekarza"}',
-        }
-        resolved = resolve_note_version(visit)
-        assert resolved.is_corrected is True
-        assert resolved.note["podsumowanie"] == "wersja lekarza"
-
-    def test_falls_back_to_ai_original(self):
-        visit = {"ai_note_original_json": '{"podsumowanie": "wersja AI"}', "doctor_note_corrected_json": None}
-        resolved = resolve_note_version(visit)
-        assert resolved.is_corrected is False
-        assert resolved.note["podsumowanie"] == "wersja AI"
-
-    def test_broken_json_does_not_raise(self):
-        """Uszkodzony JSON ma zwrócić surowy tekst do pokazania, a nie wysadzić stronę."""
-        visit = {"ai_note_original_json": "{to nie jest json", "doctor_note_corrected_json": None}
-        resolved = resolve_note_version(visit)
-        assert resolved.note is None
-        assert resolved.is_parsable is False
-        assert resolved.source_json == "{to nie jest json"
-
-    def test_no_note_at_all(self):
-        resolved = resolve_note_version({})
-        assert resolved.note is None
-        assert resolved.source_json is None
-
-
-class TestPrincipalDiagnosis:
-    """Rozpoznanie zasadnicze to jedna z niewielu rzeczy, które trafiają do dokumentacji."""
-
-    def _code(self, system, desc, *, glowne=False):
-        return VerifiedICDCode(
-            klasyfikacja=system, code="X", description=desc, rozpoznanie_glowne=glowne
-        )
-
-    def test_keeps_only_the_first_marked_principal(self):
-        codes = normalize_principal_diagnosis(
-            [
-                self._code("ICD-10", "depresja", glowne=True),
-                self._code("ICD-10", "bezsenność", glowne=True),
-            ]
-        )
-        assert [c.rozpoznanie_glowne for c in codes] == [True, False]
-
-    def test_promotes_the_first_when_none_marked(self):
-        """Model porządkuje rozpoznania od najważniejszego, więc pierwsze jest głównym."""
-        codes = normalize_principal_diagnosis(
-            [self._code("ICD-10", "depresja"), self._code("ICD-10", "bezsenność")]
-        )
-        assert [c.rozpoznanie_glowne for c in codes] == [True, False]
-
-    def test_each_classification_has_its_own_principal(self):
-        """ICD-10 i ICD-11 opisują ten sam obraz osobno — rola nie przecieka między nimi."""
-        codes = normalize_principal_diagnosis(
-            [
-                self._code("ICD-10", "depresja", glowne=True),
-                self._code("ICD-10", "bezsenność"),
-                self._code("ICD-11", "depresja"),
-                self._code("ICD-11", "bezsenność"),
-            ]
-        )
-        by_system = {}
-        for c in codes:
-            by_system.setdefault(c.klasyfikacja, []).append(c.rozpoznanie_glowne)
-        assert by_system == {"ICD-10": [True, False], "ICD-11": [True, False]}
-
-    def test_survives_the_editor_round_trip(self):
-        """Bez tego zaznaczenie „Główne" w tabeli znikałoby przy zatwierdzaniu."""
-        rows = [
-            {
-                "klasyfikacja": "ICD-10",
-                "code": "F32.1",
-                "description": "Epizod depresyjny",
-                "rozpoznanie_glowne": True,
-                "confidence": 0.8,
-            },
-            {
-                "klasyfikacja": "ICD-10",
-                "code": "F51.0",
-                "description": "Bezsenność",
-                "rozpoznanie_glowne": False,
-                "confidence": 0.6,
-            },
-        ]
-        cleaned = clean_icd_rows(rows)
-        assert [c.rozpoznanie_glowne for c in cleaned] == [True, False]
-
-
-class TestDistinctDiagnosisCount:
-    """Limit dotyczy różnych rozpoznań, nie wierszy — przy trzech klasyfikacjach to nie to samo."""
-
-    def test_same_diagnosis_across_classifications_counts_once(self):
-        codes = [
-            {"klasyfikacja": "ICD-10", "description": "Epizod depresyjny"},
-            {"klasyfikacja": "ICD-11", "description": "Epizod depresyjny"},
-            {"klasyfikacja": "DSM-5", "description": "Epizod depresyjny"},
-        ]
-        assert count_distinct_diagnoses(codes) == 1
-
-    def test_counts_distinct_names(self):
-        codes = [
-            {"description": "Epizod depresyjny"},
-            {"description": "epizod depresyjny  "},
-            {"description": "Bezsenność"},
-        ]
-        assert count_distinct_diagnoses(codes) == 2
-
-    def test_ignores_blank_rows(self):
-        assert count_distinct_diagnoses([{"description": ""}, {"description": "  "}]) == 0
-
-
-class TestCopyableTextCompleteness:
-    """Ten tekst specjalista wkleja do pliku — ma zawierać wszystko z ekranu i nic ponadto."""
-
-    def _note(self):
-        return {
-            "ryzyko_samobojcze": "NIEOBECNE",
-            "klasyfikacje": ["ICD-11"],
-            "kody_icd": [
-                {
-                    "klasyfikacja": "ICD-11",
-                    "code": "6A70.1",
-                    "description": "Epizod depresyjny umiarkowany",
-                    "oficjalna_nazwa": "Single episode depressive disorder, moderate",
-                    "weryfikacja": "POTWIERDZONY",
-                    "rozpoznanie_glowne": True,
-                    "confidence": 0.8,
-                    "uwaga": "odpowiedź rejestru — release/11/mms/search: HTTP 404",
-                }
-            ],
-        }
-
-    def test_includes_role_state_official_name_and_confidence(self):
-        text = note_to_text(self._note(), title="Wizyta #1")
-        assert "[GŁÓWNE]" in text
-        assert "[POTWIERDZONY]" in text
-        assert "wg rejestru WHO: Single episode depressive disorder, moderate" in text
-        assert "pewność 0.80" in text
-
-    def test_excludes_registry_diagnostics(self):
-        """`uwaga` niesie diagnostykę HTTP — to komunikat dla ekranu, nie dla dokumentacji."""
-        text = note_to_text(self._note(), title="Wizyta #1")
-        assert "HTTP 404" not in text
-        assert "release/11" not in text
-
-    def test_excludes_transcript(self):
-        note = self._note() | {"raw_transcript": "pacjent mówi o bezsenności"}
-        assert "pacjent mówi o bezsenności" not in note_to_text(note, title="W")
-
-    def test_marks_secondary_diagnosis(self):
-        note = self._note()
-        note["kody_icd"][0]["rozpoznanie_glowne"] = False
-        assert "[współistniejące]" in note_to_text(note, title="W")
-
-    def test_date_is_included_when_given(self):
-        text = note_to_text(self._note(), title="W", created_at="2026-09-04T10:00:00")
-        assert "Data: 2026-09-04" in text
-
-
-class TestFewShotWithoutTranscripts:
-    """Przykłady uczą stylu, a styl jest w notatce — transkrypcja to tylko koszt."""
-
-    def _examples(self):
-        return [
-            {
-                "raw_transcript": "PACJENT: nie sypiam od tygodni, TAJNA TREŚĆ WIZYTY",
-                "note_json": '{"podsumowanie": "Wizyta kontrolna."}',
-            }
-        ]
-
-    def test_transcript_is_not_sent_to_the_model(self):
-        block = build_few_shot_block(self._examples())
-        assert "TAJNA TREŚĆ WIZYTY" not in block
-        assert "Transkrypcja" not in block
-
-    def test_note_is_still_sent(self):
-        assert "Wizyta kontrolna." in build_few_shot_block(self._examples())
-
-    def test_prompt_shrinks_substantially(self):
-        """Przy 20-minutowych wizytach to była większość tekstowej części promptu."""
-        long_examples = [
-            {"raw_transcript": "słowo " * 4000, "note_json": '{"podsumowanie": "x"}'}
-            for _ in range(3)
-        ]
-        assert len(build_few_shot_block(long_examples)) < 1000
-
-    def test_empty_list_produces_nothing(self):
-        assert build_few_shot_block([]) == ""
-
-
-class TestApprovalReusesVerification:
-    """Zatwierdzanie nie może odpytywać rejestru o wiersze, których nikt nie tknął."""
-
-    def _verified(self, code="F32.1", desc="Epizod depresyjny"):
-        return {
-            "klasyfikacja": "ICD-11",
-            "code": code,
-            "description": desc,
-            "weryfikacja": "POTWIERDZONY",
-            "oficjalna_nazwa": "Moderate depressive episode",
-            "zweryfikowany": True,
-            "uwaga": "",
-        }
-
-    def test_unchanged_row_is_not_rechecked(self):
-        rows = clean_icd_rows([dict(self._verified(), confidence=0.8)])
-        reused, to_check = reuse_verification(rows, [self._verified()])
-        assert to_check == []
-        assert reused[0].weryfikacja.value == "POTWIERDZONY"
-        assert reused[0].oficjalna_nazwa == "Moderate depressive episode"
-
-    def test_edited_code_goes_back_to_the_registry(self):
-        """Kod wpisany ręcznie musi przejść weryfikację — ta reguła zostaje."""
-        rows = clean_icd_rows([dict(self._verified(code="F41.1"), confidence=0.8)])
-        reused, to_check = reuse_verification(rows, [self._verified()])
-        assert reused == []
-        assert [c.code for c in to_check] == ["F41.1"]
-
-    def test_toggling_principal_does_not_discard_verification(self):
-        """Zaznaczenie „Główne" nie zmienia niczego, o co pytalibyśmy WHO."""
-        row = dict(self._verified(), confidence=0.8, rozpoznanie_glowne=True)
-        reused, to_check = reuse_verification(clean_icd_rows([row]), [self._verified()])
-        assert to_check == []
-        assert reused[0].rozpoznanie_glowne is True
-
-    def test_new_row_has_nothing_to_reuse(self):
-        rows = clean_icd_rows([{"klasyfikacja": "ICD-11", "code": "7A00", "description": "Bezsenność"}])
-        reused, to_check = reuse_verification(rows, [])
-        assert reused == []
-        assert len(to_check) == 1
+    def test_missing(self):
+        assert format_duration(None) == "—"
+        assert format_duration(0) == "—"

@@ -91,15 +91,6 @@ def thinking_budget_for(model: str, budget: int) -> int:
         return budget
     return max(budget, _MIN_THINKING_BUDGET.get((model or "").strip().lower(), 0))
 
-# Poświadczenia do API WHO (icd.who.int/icdapi) — weryfikacja kodów rozpoznań.
-# Bez nich aplikacja działa, ale kody zostają oznaczone jako niezweryfikowane.
-# ICD-10 jest u modelu wiarygodne (dekady obecności w danych), więc domyślnie
-# NIE odpytujemy rejestru dla tej klasyfikacji. ICD-11 sprawdzamy zawsze, bo tam
-# model demonstracyjnie się myli. Ustaw na true, żeby wrócić do sprawdzania obu.
-VERIFY_ICD10 = _as_bool(os.getenv("VERIFY_ICD10") or _from_secrets("VERIFY_ICD10") or "false")
-
-ICD_CLIENT_ID = os.getenv("ICD_CLIENT_ID") or _from_secrets("ICD_CLIENT_ID") or ""
-ICD_CLIENT_SECRET = os.getenv("ICD_CLIENT_SECRET") or _from_secrets("ICD_CLIENT_SECRET") or ""
 
 USE_VERTEX_AI = _as_bool(os.getenv("USE_VERTEX_AI") or _from_secrets("USE_VERTEX_AI") or "false")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or _from_secrets("GCP_PROJECT_ID") or ""
