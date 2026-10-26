@@ -61,9 +61,14 @@ def _database_url() -> str:
 DATABASE_URL = _database_url()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or _from_secrets("GEMINI_API_KEY") or ""
-GEMINI_MODEL = os.getenv("GEMINI_MODEL") or _from_secrets("GEMINI_MODEL") or "gemini-2.5-pro"
+# Rodzinę 2.5 Google wyłączył na Vertex AI 20.10.2026 — zapytanie o nią kończy się 404.
+# Domyślny jest więc Gemini 3.8 Flash, który Google wskazuje jako następcę i 2.5 Pro,
+# i 2.5 Flash.
+DEFAULT_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or _from_secrets("GEMINI_MODEL") or DEFAULT_MODEL
 
-# Budżet tokenów „myślenia". 8192 to domyślna wartość Google dla 2.5 Pro — schodzenie
+# Budżet tokenów „myślenia" — tylko dla modeli 2.x; od Gemini 3 myślenie ustawia się
+# poziomem (`GEMINI_THINKING_LEVEL`, niżej). 8192 to domyślna wartość Google dla 2.5 Pro — schodzenie
 # poniżej niej oszczędza grosze i psuje to, po co ten model tu jest. Wcześniejsze 256
 # było wartością z czasów Flasha i przy długiej wizycie okazało się za małe: model
 # mylił objawy aktualne z tymi, które pacjent zanegował.
@@ -74,6 +79,31 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL") or _from_secrets("GEMINI_MODEL") or "ge
 GEMINI_THINKING_BUDGET = _as_int(
     os.getenv("GEMINI_THINKING_BUDGET") or _from_secrets("GEMINI_THINKING_BUDGET"), 8192
 )
+
+# Poziom myślenia modeli Gemini 3+: minimal, low, medium albo high. Te modele nie
+# przyjmują już budżetu w tokenach. `medium` to domyślna wartość Google dla Flasha —
+# kompromis między uważnym czytaniem długiej wizyty a czasem, na który czeka lekarz.
+_THINKING_LEVELS = ("minimal", "low", "medium", "high")
+_level = str(os.getenv("GEMINI_THINKING_LEVEL") or _from_secrets("GEMINI_THINKING_LEVEL") or "")
+GEMINI_THINKING_LEVEL = _level.strip().lower() if _level.strip().lower() in _THINKING_LEVELS else "medium"
+
+
+def uses_thinking_level(model: str) -> bool:
+    """Czy model steruje myśleniem poziomem (Gemini 3+), a nie budżetem tokenów (2.x).
+
+    Rozpoznajemy po numerze wersji w nazwie. Pomyłka w drugą stronę kończy się
+    błędem 400 dopiero po wysłaniu całego nagrania, więc nieznany format nazwy
+    traktujemy jak nowy model — stare 2.x mają nazwy, które znamy.
+    """
+    name = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if not name.startswith("gemini-"):
+        return True
+    version = name[len("gemini-"):].split("-", 1)[0]
+    try:
+        return float(version) >= 3
+    except ValueError:
+        return True
+
 
 # Modele, które nie potrafią wyłączyć myślenia — minimalny dopuszczalny budżet.
 # `gemini-2.5-pro` odrzuca 0, a poniżej 128 zwraca 400.
@@ -112,13 +142,17 @@ def _bool_setting(name: str, default: bool) -> bool:
 # Teraz czas czekania to dłuższe z dwóch wywołań, nie ich suma.
 SEPARATE_TRANSCRIPTION = _bool_setting("SEPARATE_TRANSCRIPTION", True)
 TRANSCRIPTION_MODEL = (
-    os.getenv("TRANSCRIPTION_MODEL") or _from_secrets("TRANSCRIPTION_MODEL") or "gemini-2.5-flash"
+    os.getenv("TRANSCRIPTION_MODEL") or _from_secrets("TRANSCRIPTION_MODEL") or DEFAULT_MODEL
 )
 
 
 USE_VERTEX_AI = _as_bool(os.getenv("USE_VERTEX_AI") or _from_secrets("USE_VERTEX_AI") or "false")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or _from_secrets("GCP_PROJECT_ID") or ""
-GCP_LOCATION = os.getenv("GCP_LOCATION") or _from_secrets("GCP_LOCATION") or "europe-west4"
+# `eu` to wieloregionalny adres Unii: przetwarzanie w krajach UE, bez wskazania jednego
+# regionu. Nowe modele trafiają tam wcześniej niż do pojedynczych regionów —
+# `gemini-3.8-flash` w `europe-west4` zwracał 404. `global` też działa, ale wtedy
+# nagranie może być przetwarzane poza UE.
+GCP_LOCATION = os.getenv("GCP_LOCATION") or _from_secrets("GCP_LOCATION") or "eu"
 
 
 def _tolerant_json_loads(raw: str) -> dict:

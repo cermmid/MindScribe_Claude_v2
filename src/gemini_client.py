@@ -11,10 +11,12 @@ from .config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
     GEMINI_THINKING_BUDGET,
+    GEMINI_THINKING_LEVEL,
     TRANSCRIPTION_MODEL,
     USE_VERTEX_AI,
     _gcp_credentials_info,
     thinking_budget_for,
+    uses_thinking_level,
 )
 from .pricing import estimate_usage_and_cost
 from .prompts import NO_SPEECH_MARKER, SYSTEM_PROMPT, TRANSCRIPTION_PROMPT, build_user_prompt
@@ -71,28 +73,33 @@ def _client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
+def _thinking_config(model: str, *, level: str, budget: int) -> types.ThinkingConfig:
+    """Gemini 3+ dostaje poziom, 2.x budżet — każda rodzina odrzuca parametr drugiej."""
+    if uses_thinking_level(model):
+        return types.ThinkingConfig(thinking_level=level.upper())
+    return types.ThinkingConfig(thinking_budget=thinking_budget_for(model, budget))
+
+
 def _generation_config(schema) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
         response_schema=schema,
         temperature=0.2,
-        thinking_config=types.ThinkingConfig(
-            thinking_budget=thinking_budget_for(GEMINI_MODEL, GEMINI_THINKING_BUDGET)
+        thinking_config=_thinking_config(
+            GEMINI_MODEL, level=GEMINI_THINKING_LEVEL, budget=GEMINI_THINKING_BUDGET
         ),
     )
 
 
 def _transcription_config() -> types.GenerateContentConfig:
-    # Bez myślenia: przepisanie rozmowy nie wymaga rozumowania, a każdy token myślenia
-    # to czas, na który czeka lekarz. Gdyby ktoś ustawił model, który myślenia wyłączyć
-    # nie umie, `thinking_budget_for` podniesie budżet do jego minimum.
+    # Najmniej myślenia, jak się da: przepisanie rozmowy nie wymaga rozumowania, a każdy
+    # token myślenia to czas, na który czeka lekarz. Gemini 3 dostaje `minimal`; modelowi
+    # 2.x, który myślenia wyłączyć nie umie, `thinking_budget_for` podniesie budżet do minimum.
     return types.GenerateContentConfig(
         system_instruction=TRANSCRIPTION_PROMPT,
         temperature=0.0,
-        thinking_config=types.ThinkingConfig(
-            thinking_budget=thinking_budget_for(TRANSCRIPTION_MODEL, 0)
-        ),
+        thinking_config=_thinking_config(TRANSCRIPTION_MODEL, level="minimal", budget=0),
     )
 
 

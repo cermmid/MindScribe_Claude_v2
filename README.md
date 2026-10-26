@@ -16,7 +16,7 @@ Zatwierdzona dokumentacja jest doklejana do kolejnych promptów jako **wzorzec s
 ## Stack
 
 - **UI + backend**: Python 3.11+, Streamlit (multi-page)
-- **AI**: Gemini 2.5 Pro (dokumentacja) i Gemini 2.5 Flash (transkrypcja, równolegle) przez `google-genai` SDK, Structured Outputs (Pydantic → `response_schema`)
+- **AI**: Gemini 3.8 Flash — dwa wywołania naraz: dokumentacja i transkrypcja — przez `google-genai` SDK, Structured Outputs (Pydantic → `response_schema`)
 - **Prompt kliniczny**: zwykły plik tekstowy `prompts/dokumentacja.md` — poprawiasz go bez dotykania kodu (patrz niżej)
 - **Audio**: przesyłane inline i analizowane multimodalnie — oba modele słuchają nagrania jednocześnie. Files API odpada — nie istnieje w Vertex AI
 - **Baza**: PostgreSQL przez SQLAlchemy (lokalnie SQLite bez konfiguracji)
@@ -62,7 +62,7 @@ MindScribe/
 │   ├── pricing.py            # wycena zużycia per model, suma dwóch wywołań
 │   └── gemini_client.py      # generate_documentation() i transcribe() — audio inline
 ├── admin/app.py              # panel właściciela (osobne hasło)
-├── tests/                    # 159 testów; db też na Postgresie przez TEST_DATABASE_URL
+├── tests/                    # 169 testów; db też na Postgresie przez TEST_DATABASE_URL
 └── data/                     # lokalny SQLite i nagrania (gitignored)
 ```
 
@@ -104,8 +104,8 @@ Cel: wysyłasz link, a odbiorca zakłada konto i korzysta — nic nie instaluje.
 4. **Advanced settings → Secrets** — wklej (wartości weź ze swojego `.streamlit/secrets.toml`):
    ```toml
    GEMINI_API_KEY = "..."
-   GEMINI_MODEL = "gemini-2.5-pro"
-   GEMINI_THINKING_BUDGET = 8192
+   GEMINI_MODEL = "gemini-3.8-flash"
+   GEMINI_THINKING_LEVEL = "medium"
    ALLOWED_EMAILS = ["lekarz@gmail.com"]
    DATABASE_URL = "postgresql://..."
    # [auth] i [auth.google] NA SAMYM KOŃCU — patrz sekcja "Logowanie i separacja danych"
@@ -208,7 +208,7 @@ Aplikacja dokleja do niego tylko krótki blok **reguł technicznych** (`src/prom
 
 ### Jak powstaje dokumentacja
 
-1. Dwa modele słuchają nagrania **jednocześnie**. Gemini 2.5 Pro zwraca **ustrukturyzowaną dokumentację**: sekcje A–Q, osobny opis każdego leku (sekcja E), status bezpieczeństwa (sekcja J) i listę kwestii do sprawdzenia. Gemini 2.5 Flash w tym samym czasie pisze **dosłowną transkrypcję** (szczegóły w *Model i koszty*).
+1. Dwa modele słuchają nagrania **jednocześnie**. Pierwsze wywołanie zwraca **ustrukturyzowaną dokumentację**: sekcje A–Q, osobny opis każdego leku (sekcja E), status bezpieczeństwa (sekcja J) i listę kwestii do sprawdzenia. Drugie w tym samym czasie pisze **dosłowną transkrypcję** (szczegóły w *Model i koszty*).
 2. Aplikacja składa z tego **jeden dokument tekstowy**, który lekarz poprawia w całości i zatwierdza.
 3. Zatwierdzony tekst trafia do bazy i staje się wzorcem stylu dla kolejnych wizyt tej osoby.
 
@@ -228,49 +228,42 @@ Nie proponuje rozpoznań ani kodów ICD/DSM, nie dopisuje własnych sugestii ter
 
 ## Model i koszty
 
-Domyślnie **`gemini-2.5-pro`** z budżetem myślenia **8192**. Przeszliśmy na niego z Flasha, bo przy długiej wizycie Flash mylił objawy aktualne z tymi, którym pacjent zaprzeczył albo które ustąpiły.
+Domyślnie **`gemini-3.8-flash`** z poziomem myślenia **`medium`**, na adresie **`eu`** Vertex AI.
+
+Dlaczego nie Pro: **Google wyłączył całą rodzinę Gemini 2.5 na Vertex AI 20 października 2026** — zapytanie o `gemini-2.5-pro` kończy się 404. Jako następcę i 2.5 Pro, i 2.5 Flash Google wskazuje 3.8 Flash, utrzymywany co najmniej do września 2027. Wcześniej przeszliśmy z 2.5 Flash na 2.5 Pro, bo Flash przy długiej wizycie mylił objawy aktualne z tymi, którym pacjent zaprzeczył — **to pierwsza rzecz do sprawdzenia na prawdziwych nagraniach z 3.8 Flash**. Jeśli wróci, podnieś `GEMINI_THINKING_LEVEL` na `high`.
+
+Dlaczego `eu`, a nie `europe-west4`: modele 3.x nie są jeszcze dostępne w pojedynczych regionach (`europe-west4` zwraca 404). `eu` to wieloregionalny adres Unii — przetwarzanie zostaje w krajach UE. `global` działa zawsze, ale wtedy nagranie może być przetwarzane poza UE.
 
 Pokrętła zmieniasz w sekretach, bez ruszania kodu (wymagają restartu aplikacji):
 
 | Zmienna | Domyślnie | Do czego |
 |---|---|---|
-| `GEMINI_MODEL` | `gemini-2.5-pro` | Zmiana modelu. Nieznany model jest wyceniany najdroższą znaną stawką i oznaczany w panelu. |
-| `GEMINI_THINKING_BUDGET` | `8192` | Tyle wynosi domyślna wartość Google dla 2.5 Pro. Niżej = taniej i gorzej; `-1` = model decyduje sam, ale koszt przestaje być przewidywalny. Pro nie umie wyłączyć myślenia — wartości poniżej 128 są podnoszone do 128. |
-| `SEPARATE_TRANSCRIPTION` | `true` | Transkrypcja osobnym modelem, równolegle z dokumentacją. `false` wraca do jednego wywołania — patrz niżej. |
-| `TRANSCRIPTION_MODEL` | `gemini-2.5-flash` | Model transkrypcji. Pracuje bez myślenia — przepisanie rozmowy nie wymaga rozumowania. |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Model dokumentacji. Nieznany model jest wyceniany najdroższą znaną stawką i oznaczany w panelu. |
+| `GEMINI_THINKING_LEVEL` | `medium` | Myślenie modeli Gemini 3+: `minimal`, `low`, `medium`, `high`. Wyżej = dokładniej, ale dłużej i drożej. |
+| `GEMINI_THINKING_BUDGET` | `8192` | To samo dla starych modeli 2.x (budżet w tokenach). Przy 3.x ignorowane — te modele odrzucają budżet. |
+| `SEPARATE_TRANSCRIPTION` | `true` | Transkrypcja osobnym wywołaniem, równolegle z dokumentacją. `false` wraca do jednego wywołania — patrz niżej. |
+| `TRANSCRIPTION_MODEL` | `gemini-3.8-flash` | Model transkrypcji. Pracuje z minimalnym myśleniem — przepisanie rozmowy nie wymaga rozumowania. |
 | `FEW_SHOT_LIMIT` | `3` | Ile zatwierdzonych dokumentacji trafia do promptu jako wzorzec stylu. `0` je wyłącza — użyj, gdyby model zaczął przenosić treść ze starych wizyt do nowej dokumentacji. |
 
 ### Transkrypcja osobno, równolegle
 
-**Rachunek i czas zależą głównie od wyjścia, nie od audio** — model pisze tekst token po tokenie. Na wyjście składają się trzy rzeczy: myślenie (8192), szczegółowa dokumentacja A–Q i dosłowna transkrypcja. Przy jednym wywołaniu wszystkie trzy pisał Pro, jedna po drugiej, a transkrypcja była z nich najdłuższa.
+**Czas zależy głównie od wyjścia, nie od audio** — model pisze tekst token po tokenie. Na wyjście składają się trzy rzeczy: myślenie, szczegółowa dokumentacja A–Q i dosłowna transkrypcja, z nich zwykle najdłuższa. Przy jednym wywołaniu model pisał je jedną po drugiej.
 
-Teraz są **dwa wywołania naraz**:
+Teraz są **dwa wywołania naraz**: jedno słucha nagrania i pisze wyłącznie dokumentację, drugie w tym samym czasie pisze dosłowną transkrypcję jako zwykły tekst. Czas oczekiwania to **dłuższe z dwóch, nie suma**. Dokumentacji nie skracamy, bo prompt kliniczny stawia kompletność ponad zwięzłość. Rzeczywiste czasy obu etapów widać po każdej wizycie i w panelu właściciela.
 
-- **Gemini 2.5 Pro** słucha całego nagrania i pisze wyłącznie dokumentację — bez przepisywania rozmowy.
-- **Gemini 2.5 Flash** w tym samym czasie pisze dosłowną transkrypcję, jako zwykły tekst, bez myślenia.
-
-Czas oczekiwania to **dłuższe z dwóch wywołań, nie ich suma** — w praktyce czas Pro, który ma teraz o jedną trzecią do połowy mniej do napisania. Dokumentacji nie skracamy, bo prompt kliniczny stawia kompletność ponad zwięzłość.
-
-Orientacyjnie, policzone modułem `src/pricing.py` (szacunki — prawdziwe czasy widać po każdej wizycie i w panelu właściciela):
-
-| Wizyta | Koszt: jedno wywołanie → dwa | Wyjście Pro: jedno → dwa | Generowanie: jedno → dwa |
-|---|---|---|---|
-| 20 min | ≈ $0,25 → ≈ $0,24 | ~19 tys. → ~13 tys. | ~2–4 min → ~1,5–3 min |
-| 45 min | ≈ $0,41 → ≈ $0,39 | ~29 tys. → ~16 tys. | ~3–6 min → ~2–3,5 min |
-
-Koszt praktycznie się nie zmienia: Flash dolicza drugie przesłuchanie audio, ale Pro nie płaci za transkrypcję po swojej, czterokrotnie wyższej stawce wyjścia. W bazie zapisuje się suma obu wywołań, a tokeny audio liczą się raz — z nich aplikacja odtwarza długość wizyty.
+Cena tej szybkości: **nagranie jest przesyłane i rozliczane dwa razy**. Orientacyjnie, przy stawce katalogowej 3.8 Flash ($1,50 za milion tokenów wejścia, $7,50 wyjścia) wizyta 20-minutowa to ok. $0,24, a 45-minutowa ok. $0,45; jedno wywołanie byłoby o mniej więcej jedną czwartą tańsze. Do końca 2026 Google liczy połowę tych stawek.
 
 Co się dzieje, gdy coś pójdzie nie tak:
 
 - **Transkrypcja się nie uda** → wizyta powstaje normalnie, bez transkrypcji, a na liście „do sprawdzenia" pojawia się informacja, że nie ma z czym porównać dokumentacji. Lekarz nie czeka drugi raz.
 - **Dokumentacja się nie uda** → błąd, jak wcześniej — to ona jest tym, po co lekarz przyszedł.
-- **Modele różnie ocenią nagranie** (Pro nie słyszy mowy, Flash ją przepisał) → informacja na liście „do sprawdzenia", zamiast cichej pustej dokumentacji.
+- **Wywołania różnie ocenią nagranie** (dokumentacja nie słyszy mowy, transkrypcja ją przepisała) → informacja na liście „do sprawdzenia", zamiast cichej pustej dokumentacji.
 
-**Powrót do jednego wywołania**: `SEPARATE_TRANSCRIPTION = false` w sekretach i restart, bez wdrażania. Warto go mieć pod ręką z jednego powodu: przy jednym wywołaniu Pro najpierw przepisywał rozmowę, a potem pisał dokumentację, mając ją przed sobą. Teraz pisze ją wprost ze słuchania. Jeśli na prawdziwych nagraniach dokumentacja zacznie gubić szczegóły albo mylić, kto co powiedział — to jest pierwsze podejrzenie i pierwszy test.
+**Powrót do jednego wywołania**: `SEPARATE_TRANSCRIPTION = false` w sekretach i restart, bez wdrażania. Taniej, wolniej — i model najpierw przepisuje rozmowę, a potem pisze dokumentację, mając ją przed sobą. W trybie równoległym pisze ją wprost ze słuchania. Jeśli na prawdziwych nagraniach dokumentacja zacznie gubić szczegóły albo mylić, kto co powiedział — to jest pierwsze podejrzenie i pierwszy test.
 
 ⚠️ **Stawki w `src/pricing.py` pochodzą ze źródeł wtórnych i wymagają potwierdzenia** w konsoli Google Cloud. Cała tabela do poprawienia siedzi w jednym bloku na górze pliku; po sprawdzeniu ustaw tam `PRICES_ARE_PROVISIONAL = False`, żeby zniknęła informacja w panelu.
 
-⚠️ **Modele Pro mają podwójną stawkę powyżej 200 tys. tokenów promptu** — to około 1 h 44 min nagrania. Aplikacja obsługuje ten próg, ale warto o nim wiedzieć, planując długość wizyt.
+⚠️ **Stawki 3.8 Flash pochodzą z serwisów zbierających cenniki**, nie z oficjalnej strony Google, a adres `eu` bywa o ~10% droższy niż `global`. Potwierdź je w konsoli Google Cloud (Rozliczenia).
 
 ## Panel właściciela (koszty i statystyki)
 
@@ -316,7 +309,7 @@ Vertex AI w Google Cloud nie wykorzystuje danych klienta do trenowania modeli pu
    ```toml
    USE_VERTEX_AI = true
    GCP_PROJECT_ID = "twoj-projekt-id"
-   GCP_LOCATION = "europe-west4"    # region UE; fallback: "europe-west1"
+   GCP_LOCATION = "eu"              # cała UE; pojedyncze regiony nie mają jeszcze modeli 3.x
 
    GOOGLE_APPLICATION_CREDENTIALS_JSON = """
    <<wklej tutaj CAŁY plik JSON service account, bez zmian>>

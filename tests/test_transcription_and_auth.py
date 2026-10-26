@@ -293,3 +293,44 @@ class TestSecretsTemplate:
         assert google["server_metadata_url"].startswith("https://accounts.google.com/")
         assert set(google) == {"client_id", "client_secret", "server_metadata_url"}
         assert "auth0" not in data["auth"]
+
+
+# --- Myślenie: poziom dla Gemini 3+, budżet dla 2.x -----------------------------
+
+
+class TestThinkingConfig:
+    @pytest.mark.parametrize(
+        "model, expected",
+        [
+            ("gemini-3.8-flash", True),
+            ("gemini-3.5-flash-lite", True),
+            ("publishers/google/models/gemini-3.8-flash", True),
+            ("gemini-2.5-pro", False),
+            ("gemini-2.5-flash", False),
+            ("cos-zupelnie-innego", True),
+        ],
+    )
+    def test_family_detection(self, model, expected):
+        assert config.uses_thinking_level(model) is expected
+
+    def test_gemini_3_gets_level_not_budget(self):
+        """Gemini 3 odrzuca budżet — wysłanie go kończy się błędem po wysłaniu nagrania."""
+        cfg = gemini_client._thinking_config("gemini-3.8-flash", level="medium", budget=8192)
+        assert cfg.thinking_budget is None
+        assert str(cfg.thinking_level).endswith("MEDIUM")
+
+    def test_gemini_2_gets_budget_not_level(self):
+        cfg = gemini_client._thinking_config("gemini-2.5-pro", level="medium", budget=0)
+        assert cfg.thinking_level is None
+        assert cfg.thinking_budget == 128
+
+    def test_transcription_thinks_minimally(self, monkeypatch):
+        monkeypatch.setattr(gemini_client, "TRANSCRIPTION_MODEL", "gemini-3.8-flash")
+        cfg = gemini_client._transcription_config()
+        assert str(cfg.thinking_config.thinking_level).endswith("MINIMAL")
+
+    def test_default_model_is_priced(self):
+        """Domyślny model musi mieć stawki — inaczej panel liczy koszt najdroższą znaną."""
+        from src.pricing import is_priced
+
+        assert is_priced(config.DEFAULT_MODEL)

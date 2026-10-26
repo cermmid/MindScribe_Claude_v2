@@ -36,12 +36,16 @@ class ModelPricing:
 
 # --- Jedyne miejsce z liczbami z cennika ---------------------------------------
 
-PRICES_CHECKED_ON = "2026-09-03"
+PRICES_CHECKED_ON = "2026-10-26"
 # Ceny pochodzą ze źródeł wtórnych — oficjalne domeny Google były niedostępne przy
 # ich ustalaniu. Potwierdź w konsoli Google Cloud, zanim oprzesz na nich wycenę usługi.
 PRICES_ARE_PROVISIONAL = True
 
 MODEL_PRICING_USD_PER_1M: dict[str, ModelPricing] = {
+    # Stawki katalogowe. Do 31.12.2026 Google daje na 3.8 Flash cenę promocyjną
+    # o połowę niższą (0,75 / 3,75) — liczymy katalogową, żeby szacunek nie zaniżał
+    # kosztów od stycznia. Adres `eu` bywa o ~10% droższy. Audio jak tekst.
+    "gemini-3.8-flash": ModelPricing(standard=Rates(1.50, 1.50, 7.50)),
     "gemini-2.5-flash": ModelPricing(standard=Rates(0.30, 1.00, 2.50)),
     "gemini-2.5-pro": ModelPricing(
         standard=Rates(1.25, 1.25, 10.00),
