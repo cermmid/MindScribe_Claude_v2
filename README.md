@@ -106,14 +106,14 @@ Cel: wysyłasz link, a odbiorca zakłada konto i korzysta — nic nie instaluje.
    GEMINI_API_KEY = "..."
    GEMINI_MODEL = "gemini-3.8-flash"
    GEMINI_THINKING_LEVEL = "medium"
-   ALLOWED_EMAILS = ["lekarz@gmail.com"]
+   ALLOWED_EMAILS = []   # dostęp ustawiasz w Google — patrz "Kto może wejść"
    DATABASE_URL = "postgresql://..."
    # [auth] i [auth.google] NA SAMYM KOŃCU — patrz sekcja "Logowanie i separacja danych"
    ```
    ⚠️ Kolejność ma znaczenie. W TOML-u każdy klucz pod nagłówkiem `[auth.google]` należy do tej tabeli — wpisany tam `DATABASE_URL` aplikacja po prostu nie zobaczy i po cichu użyje znikającego SQLite. Wszystkie zwykłe klucze idą na górę, tabele `[auth]` na dół (tak jak w `.streamlit/secrets.toml.example`).
 5. **Deploy**. Po ~2 minutach apka żyje. Wysyłasz lekarzowi:
    > Link: https://mindscribe-v2.streamlit.app
-   > Logujesz się swoim kontem Google (adres musi być na liście `ALLOWED_EMAILS`).
+   > Logujesz się swoim kontem Google (adres musi być na liście użytkowników testowych).
 
 Każdy push do tego brancha automatycznie redeployuje apkę.
 
@@ -128,18 +128,20 @@ Każdy push do tego brancha automatycznie redeployuje apkę.
 
 Każdy specjalista loguje się **własnym kontem Google** i **widzi wyłącznie swoje wizyty**. Logowanie idzie natywnym `st.login()`, więc aplikacja nie przechowuje żadnych haseł, a sesja żyje w podpisanym ciasteczku — odświeżenie strony ani wygaszony ekran telefonu nie wylogowują.
 
-### Kto może wejść — `ALLOWED_EMAILS`
+### Kto może wejść — jedna lista, w Google
 
-Zalogować się kontem Google może każdy, kto je ma, a każda wizyta kosztuje i trafia do bazy. Dlatego jest lista dozwolonych adresów:
+Dostęp ustawiasz **w jednym miejscu: na liście użytkowników testowych klienta OAuth** w Google Cloud (*Google Auth Platform → Odbiorcy → Użytkownicy testowi*). Dopóki klient jest w stanie **Testowanie**, Google nie wpuści nikogo spoza tej listy — osoba spoza niej zobaczy błąd Google, zanim w ogóle dotrze do aplikacji. Dodanie osoby to wpisanie adresu tam; w aplikacji nic nie zmieniasz.
+
+- **Nie przełączaj klienta na „W produkcji”.** Wtedy lista użytkowników testowych przestaje działać i zalogować się może każdy z kontem Google — a każda wizyta kosztuje i trafia do bazy.
+- Lista testowa mieści do 100 osób.
+
+`ALLOWED_EMAILS` w sekretach aplikacji to **opcjonalna** druga warstwa — zostaw ją pustą (`ALLOWED_EMAILS = []`), żeby nie prowadzić dwóch list. Przydaje się dopiero, gdyby klient OAuth musiał kiedyś przejść do produkcji:
 
 ```toml
 ALLOWED_EMAILS = ["lekarz@gmail.com", "druga.osoba@example.com"]
 ```
 
-- Adres musi być na liście **i być zweryfikowany przez Google** — niezweryfikowanego adresu nie traktujemy jako dowodu tożsamości.
-- Wielkość liter nie ma znaczenia. W `.env` lista idzie po przecinku: `ALLOWED_EMAILS=a@x.pl,b@x.pl`.
-- **Pusta lista wpuszcza każdego** z kontem Google. Używaj tego wyłącznie lokalnie.
-- Osoba spoza listy widzi komunikat i przycisk wylogowania — do aplikacji nie wejdzie.
+Ustawiona lista wpuszcza wyłącznie wymienione adresy, potwierdzone przez Google; wielkość liter nie ma znaczenia. Osoba spoza niej widzi komunikat i przycisk wylogowania.
 
 ### Konfiguracja logowania Google (10 min)
 
