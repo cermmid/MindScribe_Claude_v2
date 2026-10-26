@@ -1,4 +1,4 @@
-from functools import lru_cache
+import threading
 from pathlib import Path
 
 from google import genai
@@ -43,8 +43,26 @@ def _vertex_credentials():
     )
 
 
-@lru_cache(maxsize=1)
+_CLIENT: genai.Client | None = None
+_CLIENT_LOCK = threading.Lock()
+
+
 def _client() -> genai.Client:
+    """Jeden klient na proces, tworzony pod blokadą.
+
+    Nie `lru_cache`: dokumentacja i transkrypcja startują w dwóch wątkach naraz, więc
+    przy pierwszym wywołaniu `lru_cache` potrafił zbudować DWA klienty i zapamiętać
+    jeden. Drugi, bez żadnej referencji, sprzątał garbage collector — a `Client.__del__`
+    zamyka połączenie HTTP w trakcie wysyłania nagrania („client has been closed").
+    """
+    global _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is None:
+            _CLIENT = _build_client()
+        return _CLIENT
+
+
+def _build_client() -> genai.Client:
     if USE_VERTEX_AI:
         if not GCP_PROJECT_ID:
             raise RuntimeError(
@@ -162,7 +180,8 @@ def generate_documentation(
     prompt = build_user_prompt(
         few_shot_examples, transcript=None, visit_type=visit_type, with_transcript=with_transcript
     )
-    response = _client().models.generate_content(
+    client = _client()  # referencja na czas zapytania — patrz `_client`
+    response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[prompt, _audio_part(audio_path, mime_type)],
         config=_generation_config(schema),
@@ -172,7 +191,8 @@ def generate_documentation(
 
 def transcribe(audio_path: Path, *, mime_type: str | None = None) -> tuple[str, dict]:
     """Dosłowna transkrypcja szybszym modelem — zwykły tekst, bez schematu JSON."""
-    response = _client().models.generate_content(
+    client = _client()
+    response = client.models.generate_content(
         model=TRANSCRIPTION_MODEL,
         contents=[_audio_part(audio_path, mime_type)],
         config=_transcription_config(),

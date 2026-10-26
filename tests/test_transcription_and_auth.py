@@ -334,3 +334,28 @@ class TestThinkingConfig:
         from src.pricing import is_priced
 
         assert is_priced(config.DEFAULT_MODEL)
+
+
+class TestClientIsShared:
+    def test_parallel_first_calls_build_one_client(self, monkeypatch):
+        """Regresja: dwa klienty z wyścigu → jeden sprzątany przez GC w trakcie zapytania."""
+        import threading
+        import time as _time
+
+        built = []
+
+        def slow_build():
+            _time.sleep(0.05)  # okno na wyścig, jak przy prawdziwym logowaniu do Vertex
+            built.append(object())
+            return built[-1]
+
+        monkeypatch.setattr(gemini_client, "_CLIENT", None)
+        monkeypatch.setattr(gemini_client, "_build_client", slow_build)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(gemini_client._client())) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(built) == 1
+        assert all(r is built[0] for r in results)
