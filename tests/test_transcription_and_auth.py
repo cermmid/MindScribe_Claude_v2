@@ -359,3 +359,14 @@ class TestClientIsShared:
             t.join()
         assert len(built) == 1
         assert all(r is built[0] for r in results)
+
+    def test_client_retries_quota_errors(self, monkeypatch):
+        """429 z Vertex to zwykle chwilowo pełna pula mocy — ma być ponowione, nie pokazane lekarzowi."""
+        captured = {}
+        monkeypatch.setattr(gemini_client, "USE_VERTEX_AI", False)
+        monkeypatch.setattr(gemini_client, "GEMINI_API_KEY", "klucz-testowy")
+        monkeypatch.setattr(gemini_client.genai, "Client", lambda **kw: captured.update(kw) or object())
+        gemini_client._build_client()
+        retry = captured["http_options"].retry_options
+        assert retry.attempts >= 3
+        assert 429 in retry.http_status_codes

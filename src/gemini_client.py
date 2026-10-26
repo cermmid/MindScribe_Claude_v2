@@ -62,6 +62,24 @@ def _client() -> genai.Client:
         return _CLIENT
 
 
+def _http_options() -> types.HttpOptions:
+    """Ponawianie przy 429 i błędach 5xx, z rosnącą przerwą.
+
+    Gemini 3 na Vertex AI nie ma stałego limitu na projekt, tylko wspólną pulę mocy
+    Google (Dynamic Shared Quota). Gdy pula jest chwilowo pełna, Vertex odpowiada 429
+    — zwykle na kilka sekund. Bez ponawiania lekarz dostawał błąd i musiał klikać
+    jeszcze raz; tu robi to aplikacja: 2, 4, 8, 16 s, razem do ~30 s czekania.
+    """
+    return types.HttpOptions(
+        retry_options=types.HttpRetryOptions(
+            attempts=5,
+            initial_delay=2.0,
+            max_delay=16.0,
+            http_status_codes=[408, 429, 500, 502, 503, 504],
+        )
+    )
+
+
 def _build_client() -> genai.Client:
     if USE_VERTEX_AI:
         if not GCP_PROJECT_ID:
@@ -81,6 +99,7 @@ def _build_client() -> genai.Client:
             project=GCP_PROJECT_ID,
             location=GCP_LOCATION,
             credentials=creds,
+            http_options=_http_options(),
         )
 
     if not GEMINI_API_KEY:
@@ -88,7 +107,7 @@ def _build_client() -> genai.Client:
             "Brak GEMINI_API_KEY. Skopiuj .env.example do .env i uzupełnij klucz, "
             "albo włącz Vertex AI (USE_VERTEX_AI=true)."
         )
-    return genai.Client(api_key=GEMINI_API_KEY)
+    return genai.Client(api_key=GEMINI_API_KEY, http_options=_http_options())
 
 
 def _thinking_config(model: str, *, level: str, budget: int) -> types.ThinkingConfig:
