@@ -23,6 +23,7 @@ from src.formatting import (
     audio_quality_label,
     audio_unusable,
     draft_to_document,
+    risk_is_urgent,
     risk_status,
     with_header,
 )
@@ -41,8 +42,23 @@ def _draft(**overrides) -> dict:
     base = DokumentacjaDraft(
         jakosc_nagrania="DOBRA",
         raw_transcript="transkrypcja",
-        j_bezpieczenstwo={"status": "NIE_OCENIANO"},
+        notatka="Pacjent zgłasza się na wizytę kontrolną.",
+        bezpieczenstwo={"status": "NIE_OCENIANO"},
     ).model_dump(mode="json")
+    base.update(overrides)
+    return base
+
+
+def _legacy_draft(**overrides) -> dict:
+    """Szkic zapisany w poprzednim formacie: każdy obszar A–Q w osobnym polu."""
+    base = {field: "" for field, _ in SEKCJE}
+    base.update(
+        jakosc_nagrania="DOBRA",
+        raw_transcript="transkrypcja",
+        e_leki=[],
+        j_bezpieczenstwo={"status": "NIE_OCENIANO", "opis": "", "pilne": False},
+        do_weryfikacji=[],
+    )
     base.update(overrides)
     return base
 
@@ -55,28 +71,28 @@ class TestSchema:
         """Trzeci stan jest powodem zmiany: brak rozmowy o ryzyku to nie zaprzeczenie."""
         assert {r.value for r in Ryzyko} == {"OBECNE", "ZAPRZECZA", "NIE_OCENIANO"}
 
-    def test_sections_default_to_empty(self):
-        """Puste sekcje są poprawną odpowiedzią — model nie musi niczego wypełniać."""
+    def test_note_defaults_to_empty(self):
+        """Pusta notatka jest poprawną odpowiedzią — np. przy niemym nagraniu."""
         draft = DokumentacjaDraft(
-            jakosc_nagrania="DOBRA", raw_transcript="", j_bezpieczenstwo={"status": "NIE_OCENIANO"}
+            jakosc_nagrania="DOBRA", raw_transcript="", bezpieczenstwo={"status": "NIE_OCENIANO"}
         )
-        assert draft.c_aktualne_objawy == ""
-        assert draft.e_leki == []
+        assert draft.notatka == ""
         assert draft.do_weryfikacji == []
 
-    def test_transcript_is_generated_before_sections(self):
-        """Gemini generuje pola po kolei — sekcje mają powstawać z transkrypcją przed oczami."""
+    def test_transcript_is_generated_before_the_note(self):
+        """Gemini generuje pola po kolei — notatka ma powstawać z transkrypcją przed oczami."""
         fields = list(DokumentacjaDraft.model_fields)
-        assert fields.index("raw_transcript") < fields.index("a_dane_ogolne")
+        assert fields.index("raw_transcript") < fields.index("notatka")
+
+    def test_note_is_one_field_not_sections(self):
+        """Notatka to jeden tekst lekarza — schemat nie może wymuszać podziału na sekcje."""
+        fields = set(DokumentacjaDraft.model_fields)
+        assert "notatka" in fields
+        assert not fields & {field for field, _ in SEKCJE}
 
     def test_review_list_is_generated_last(self):
         """Kontrola kompletności z punktu 6 ma nastąpić po napisaniu całości."""
         assert list(DokumentacjaDraft.model_fields)[-1] == "do_weryfikacji"
-
-    def test_every_section_has_a_field(self):
-        fields = set(DokumentacjaDraft.model_fields)
-        assert all(field in fields for field, _ in SEKCJE)
-        assert [title[0] for _, title in SEKCJE] == list("ABCDEFGHIJKLMNOPQ")
 
     def test_no_diagnosis_or_suggestion_fields(self):
         """Prompt: „nie stawiaj rozpoznań, nie twórz planów leczenia"."""
@@ -100,6 +116,12 @@ class TestPrompt:
 
     def test_silent_recording_rule_is_present(self):
         assert "BRAK_MOWY" in SYSTEM_PROMPT
+
+    def test_note_form_is_continuous_text(self):
+        """Obszary A–Q to lista kontrolna, nie nagłówki — tak mówi prompt, nie tylko schemat."""
+        assert "To NIE są nagłówki" in SYSTEM_PROMPT
+        assert "bez nagłówków" in SYSTEM_PROMPT
+        assert "według poniższej struktury" not in SYSTEM_PROMPT
 
     def test_prompt_file_has_no_invisible_characters(self):
         """Wklejony tekst miał miękki dzielnik w słowie „Dawkę" — niewidoczny, ale w tokenach."""
@@ -130,65 +152,40 @@ class TestFewShot:
     def test_no_examples_no_block(self):
         assert build_few_shot_block([]) == ""
 
+    def test_sectioned_examples_are_skipped(self):
+        """Stara dokumentacja z nagłówkami A–Q ciągnęłaby model z powrotem do sekcji."""
+        old = "A. Dane ogólne\nx\n\nB. Główny powód\ny\n\nC. Objawy\nz"
+        block = build_few_shot_block([self._approved(old), self._approved("Notatka ciągłym tekstem.")])
+        assert "Notatka ciągłym tekstem." in block
+        assert "A. Dane ogólne" not in block
+
 
 # --- Składanie dokumentu -----------------------------------------------------------
 
 
 class TestDraftToDocument:
-    def test_all_sections_in_order(self):
+    def test_note_is_the_document(self):
+        doc = draft_to_document(_draft(notatka="Pacjent opisuje trudności z zasypianiem.\n\nZalecono kontrolę."))
+        assert doc == "Pacjent opisuje trudności z zasypianiem.\n\nZalecono kontrolę.\n"
+
+    def test_no_section_headings_or_not_discussed_markers(self):
+        """Notatka lekarza, nie formularz: bez nagłówków A–Q i bez „nie poruszono"."""
         doc = draft_to_document(_draft())
-        positions = [doc.index(title) for _, title in SEKCJE]
-        assert positions == sorted(positions)
-
-    def test_empty_section_is_marked_not_skipped(self):
-        """Lekarz ma widzieć, które obszary wizyta pominęła — to kontrola kompletności."""
-        doc = draft_to_document(_draft())
-        block = doc.split("K. Objawy psychotyczne")[1].split("L. Inne")[0]
-        assert NIE_PORUSZONO in block
-
-    def test_section_content_is_kept(self):
-        doc = draft_to_document(_draft(c_aktualne_objawy="Pacjent opisuje trudności z zasypianiem."))
-        assert "Pacjent opisuje trudności z zasypianiem." in doc
-
-    def test_unassessed_risk_never_reads_as_denial(self):
-        """Główny powód zmiany: brak rozmowy o ryzyku nie może wyglądać jak „bez myśli s."."""
-        doc = draft_to_document(_draft(j_bezpieczenstwo={"status": "NIE_OCENIANO", "opis": ""}))
-        assert J_NIE_OCENIANO in doc
-        assert "zaprzecza" not in doc.lower()
+        assert NIE_PORUSZONO not in doc
+        assert not any(title in doc for _, title in SEKCJE)
 
     def test_missing_risk_section_defaults_to_unassessed(self):
         """Uszkodzony albo niekompletny zapis nie może dać „zaprzecza" przez przypadek."""
         assert risk_status({}) == "NIE_OCENIANO"
-        assert risk_status({"j_bezpieczenstwo": {"status": "COS"}}) == "NIE_OCENIANO"
+        assert risk_status({"bezpieczenstwo": {"status": "COS"}}) == "NIE_OCENIANO"
+        assert risk_status(_draft(bezpieczenstwo={"status": "ZAPRZECZA"})) == "ZAPRZECZA"
 
-    def test_denial_is_stated_when_discussed(self):
-        doc = draft_to_document(
-            _draft(j_bezpieczenstwo={"status": "ZAPRZECZA", "opis": "Pacjent zaprzecza myślom rezygnacyjnym."})
-        )
-        assert "pacjent zaprzecza" in doc
-        assert "Pacjent zaprzecza myślom rezygnacyjnym." in doc
-
-    def test_urgent_flag_is_visible_in_the_document(self):
-        doc = draft_to_document(
-            _draft(j_bezpieczenstwo={"status": "OBECNE", "opis": "Plan i dostęp do środków.", "pilne": True})
-        )
-        assert PILNE in doc
-
-    def test_each_medication_gets_its_own_entry(self):
-        doc = draft_to_document(
-            _draft(
-                e_leki=[
-                    {"nazwa": "sertralina", "opis": "50 mg, bez poprawy po 6 tygodniach."},
-                    {"nazwa": "kwetiapina (nazwa niepewna)", "opis": "Na sen, odstawiona samodzielnie."},
-                ]
-            )
-        )
-        assert "1. sertralina\n50 mg, bez poprawy po 6 tygodniach." in doc
-        assert "2. kwetiapina (nazwa niepewna)" in doc
+    def test_urgent_flag_is_read_for_the_banner(self):
+        assert risk_is_urgent(_draft(bezpieczenstwo={"status": "OBECNE", "pilne": True}))
 
     def test_review_list_stays_out_of_the_document(self):
         """To zadania dla lekarza, nie treść dokumentacji medycznej."""
-        doc = draft_to_document(_draft(do_weryfikacji=["Dawka sertraliny niejasna (sekcja E)."]))
+        doc = draft_to_document(_draft(do_weryfikacji=["Dawka sertraliny niejasna."]))
         assert "Dawka sertraliny niejasna" not in doc
 
     def test_transcript_stays_out_of_the_document(self):
@@ -196,9 +193,45 @@ class TestDraftToDocument:
         assert "PEŁNY ZAPIS ROZMOWY" not in doc
 
     def test_failed_recording_is_announced_first(self):
-        """Inaczej nieme nagranie wygląda jak wizyta, na której niczego nie omówiono."""
-        doc = draft_to_document(_draft(jakosc_nagrania="BRAK_MOWY", raw_transcript=""))
+        """Inaczej pusta notatka wygląda jak wizyta, na której niczego nie omówiono."""
+        doc = draft_to_document(_draft(jakosc_nagrania="BRAK_MOWY", raw_transcript="", notatka=""))
         assert doc.startswith("!! UWAGA")
+
+    def test_poor_recording_warning_precedes_the_note(self):
+        doc = draft_to_document(_draft(jakosc_nagrania="SLABA", notatka="Treść."))
+        assert doc.startswith("!! UWAGA")
+        assert doc.rstrip().endswith("Treść.")
+
+
+class TestLegacyDrafts:
+    """Szkice zapisane przed przejściem na notatkę — historia ma je dalej pokazywać."""
+
+    def test_rendered_with_sections_in_order(self):
+        doc = draft_to_document(_legacy_draft(c_aktualne_objawy="Objawy."))
+        positions = [doc.index(title) for _, title in SEKCJE]
+        assert positions == sorted(positions)
+        assert "Objawy." in doc
+
+    def test_unassessed_risk_never_reads_as_denial(self):
+        doc = draft_to_document(_legacy_draft())
+        assert J_NIE_OCENIANO in doc
+        assert "zaprzecza" not in doc.lower()
+
+    def test_urgent_flag_and_medications_survive(self):
+        doc = draft_to_document(
+            _legacy_draft(
+                j_bezpieczenstwo={"status": "OBECNE", "opis": "Plan.", "pilne": True},
+                e_leki=[{"nazwa": "sertralina", "opis": "50 mg"}],
+            )
+        )
+        assert PILNE in doc
+        assert "1. sertralina\n50 mg" in doc
+        assert risk_status(_legacy_draft(j_bezpieczenstwo={"status": "OBECNE"})) == "OBECNE"
+
+    def test_history_resolves_legacy_draft(self):
+        resolved = resolve_note_version({"ai_note_original_json": json.dumps(_legacy_draft(b_powod_zgloszenia="Stary szkic."))})
+        assert resolved.document is not None
+        assert "Stary szkic." in resolved.document
 
     def test_header_comes_from_the_record(self):
         text = with_header(
@@ -279,7 +312,7 @@ class TestApproveFailsLoudly:
 class TestResolveNoteVersion:
     def test_approved_document_wins(self):
         visit = {
-            "ai_note_original_json": json.dumps(_draft(c_aktualne_objawy="wersja asystenta")),
+            "ai_note_original_json": json.dumps(_draft(notatka="wersja asystenta")),
             "doctor_note_corrected_json": json.dumps({"dokument": "wersja lekarza", "ryzyko": "OBECNE"}),
         }
         resolved = resolve_note_version(visit)
@@ -288,7 +321,7 @@ class TestResolveNoteVersion:
         assert resolved.ryzyko == "OBECNE"
 
     def test_falls_back_to_rendered_draft(self):
-        visit = {"ai_note_original_json": json.dumps(_draft(c_aktualne_objawy="wersja asystenta"))}
+        visit = {"ai_note_original_json": json.dumps(_draft(notatka="wersja asystenta"))}
         resolved = resolve_note_version(visit)
         assert resolved.is_approved is False
         assert "wersja asystenta" in resolved.document
@@ -326,12 +359,11 @@ class TestDocumentView:
 
         assert "  \n" in _escape("linia pierwsza\nlinia druga")
 
-    def test_splits_on_section_headings(self):
+    def test_note_is_shown_as_one_block(self):
         from src.ui import _split_sections
 
-        doc = draft_to_document(_draft(c_aktualne_objawy="Objawy."))
-        titles = [title for title, _ in _split_sections(doc) if title]
-        assert titles == [title for _, title in SEKCJE]
+        doc = draft_to_document(_draft(notatka="Akapit pierwszy.\n\nAkapit drugi."))
+        assert _split_sections(doc) == [(None, "Akapit pierwszy.\n\nAkapit drugi.")]
 
     def test_edited_headings_do_not_lose_content(self):
         """Lekarz mógł przeredagować nagłówki — wtedy treść ma zostać, choć bez podziału."""

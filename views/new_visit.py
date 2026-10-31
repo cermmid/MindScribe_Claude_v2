@@ -28,7 +28,24 @@ from src.ui import (
     visit_caption,
 )
 
-st.title("🎙️ Nowa wizyta")
+st.title("🎙️ Wizyta")
+
+# Klucze widżetów formularza mają w sobie numer wizyty na tej stronie. Przycisk
+# „Nowa wizyta" na dole podbija numer — Streamlit widzi wtedy nowe widżety i pokazuje
+# je puste (bez nagrania, etykiety, wybranego pliku), bez przechodzenia przez inne strony.
+_form = st.session_state.setdefault("visit_form_nonce", 0)
+
+_VISIT_STATE = (
+    "current_visit_id",
+    "current_draft",
+    "current_document",
+    "current_visit_type",
+    "debug_prompt",
+    "approved_doc",
+    "approved_visit_id",
+    "approved_visit_created_at",
+    "approved_visit_type",
+)
 
 # --- 1. Dane wizyty ------------------------------------------------------------
 st.header("1. Dane wizyty")
@@ -39,18 +56,20 @@ visit_label = st.text_input(
         "NIE wpisuj imienia, nazwiska ani żadnych danych, które umożliwią identyfikację "
         "pacjenta przez osoby trzecie. Używaj pseudonimu lub krótkiego opisu."
     ),
+    key=f"visit_label_{_form}",
 )
-visit_type = st.radio("Typ wizyty", ["Pierwsza", "Kolejna"], horizontal=True)
+visit_type = st.radio("Typ wizyty", ["Pierwsza", "Kolejna"], horizontal=True, key=f"visit_type_{_form}")
 
 # --- 2. Wejście audio ----------------------------------------------------------
 st.header("2. Wejście audio")
 col_a, col_b = st.columns(2)
 with col_a:
-    recorded = st.audio_input("🎙️ Nagraj wizytę")
+    recorded = st.audio_input("🎙️ Nagraj wizytę", key=f"recorded_{_form}")
 with col_b:
     uploaded = st.file_uploader(
         "…albo wgraj plik audio (mp3 / wav / m4a / ogg)",
         type=["mp3", "wav", "m4a", "ogg", "webm", "flac"],
+        key=f"uploaded_{_form}",
     )
 
 audio_bytes: bytes | None = None
@@ -66,11 +85,11 @@ elif uploaded is not None:
     audio_mime = getattr(uploaded, "type", None)
     audio_suffix = derive_audio_suffix(uploaded.name)
 
-# --- 3. Generowanie dokumentacji -----------------------------------------------
-st.header("3. Generowanie dokumentacji")
+# --- 3. Notatka z wizyty -------------------------------------------------------
+st.header("3. Notatka z wizyty")
 
 # Cisza w nagraniu = model nie ma czego transkrybować. Sprawdzamy PRZED wysyłką,
-# żeby nie płacić za pustą dokumentację i żeby lekarz od razu wiedział, że to mikrofon.
+# żeby nie płacić za pustą notatkę i żeby lekarz od razu wiedział, że to mikrofon.
 _silent = audio_bytes is not None and looks_silent(audio_bytes, audio_mime)
 _force = False
 if _silent:
@@ -85,10 +104,10 @@ if _silent:
         "kłódki/mikrofonu przy adresie strony i wybierz właściwy mikrofon.\n"
         "3. **Inna aplikacja trzyma mikrofon** (Teams, Zoom, Discord) — zamknij ją i odśwież stronę."
     )
-    _force = st.checkbox("Wyślij mimo to (jeśli uważasz, że nagranie jest dobre)")
+    _force = st.checkbox("Wyślij mimo to (jeśli uważasz, że nagranie jest dobre)", key=f"force_{_form}")
 
 if st.button(
-    "🪄 Przygotuj dokumentację",
+    "🪄 Przygotuj notatkę",
     type="primary",
     disabled=audio_bytes is None or (_silent and not _force),
 ):
@@ -97,11 +116,10 @@ if st.button(
     except DatabaseUnavailable as exc:
         st.error(str(exc))
         st.stop()
-    # Szczegółowa dokumentacja jest kilka razy dłuższa niż dawna notatka — lepiej
-    # uprzedzić, niż zostawić lekarza z wrażeniem, że aplikacja się zawiesiła.
+    # Lepiej uprzedzić, niż zostawić lekarza z wrażeniem, że aplikacja się zawiesiła.
     _spinner_text = (
-        "Słucham nagrania i przygotowuję szczegółową dokumentację… "
-        "przy dłuższej wizycie to potrwa kilka minut."
+        "Słucham nagrania i piszę notatkę z wizyty… przy dłuższej wizycie to potrwa "
+        "kilka minut."
     )
     if few_shot:
         _spinner_text += f" Styl na podstawie {len(few_shot)} wcześniej zatwierdzonych."
@@ -125,7 +143,7 @@ if st.button(
             st.stop()
 
     # Nowa wizyta wypiera poprzednią zatwierdzoną z widoku — inaczej pod spodem wisiałaby
-    # cudza dokumentacja i łatwo byłoby skopiować nie tę.
+    # cudza notatka i łatwo byłoby skopiować nie tę.
     for key in ("approved_doc", "approved_visit_id", "approved_visit_created_at", "approved_visit_type"):
         st.session_state.pop(key, None)
     st.session_state["current_visit_id"] = created.visit_id
@@ -154,7 +172,7 @@ if "current_draft" in st.session_state:
     if audio_unusable(draft):
         st.error(
             "🔇 **W nagraniu nie wykryto zrozumiałej mowy.** "
-            "Dokumentacja poniżej jest pusta — to poprawne zachowanie, model ma zakaz "
+            "Notatka poniżej jest pusta — to poprawne zachowanie, model ma zakaz "
             "tworzenia treści, której nie słyszał. Sprawdź mikrofon i nagraj wizytę ponownie."
         )
     elif warning := audio_quality_label(draft):
@@ -164,7 +182,7 @@ if "current_draft" in st.session_state:
     if not _transcript and not audio_unusable(draft):
         st.warning(
             "Transkrypcja jest pusta, choć model nie zgłosił problemu z nagraniem. "
-            "Zweryfikuj nagranie przed zatwierdzeniem dokumentacji."
+            "Zweryfikuj nagranie przed zatwierdzeniem notatki."
         )
 
     _pilne = risk_is_urgent(draft)
@@ -185,14 +203,14 @@ if "current_draft" in st.session_state:
     # Klucz związany z wizytą: nowe generowanie musi dać świeży tekst, a nie zostawić
     # w polu poprawki wniesione do poprzedniej wizyty.
     document = st.text_area(
-        "Dokumentacja — popraw dowolny fragment przed zatwierdzeniem",
+        "Notatka z wizyty — popraw dowolny fragment przed zatwierdzeniem",
         value=st.session_state["current_document"],
-        height=720,
+        height=520,
         key=f"document_{visit_id}",
     )
 
-    # Jedyny element poza tekstem. Status ryzyka jest w treści sekcji J, ale lekarz mógł
-    # ją przeredagować — tu potwierdza go jawnie, bo aplikacja używa go do ostrzeżeń.
+    # Jedyny element poza tekstem. O ryzyku może być mowa w notatce, ale lekarz mógł
+    # ją przeredagować — tu potwierdza status jawnie, bo aplikacja używa go do ostrzeżeń.
     _statuses = list(RYZYKO_OPIS)
     _default = risk_status(draft)
     ryzyko = st.radio(
@@ -219,7 +237,7 @@ if "current_draft" in st.session_state:
                 jakosc_nagrania=draft.get("jakosc_nagrania") or "DOBRA",
             )
         except Exception as e:
-            st.error(f"Dokumentacja nie przeszła walidacji: {e}")
+            st.error(f"Notatka nie przeszła walidacji: {e}")
             st.stop()
 
         try:
@@ -227,7 +245,7 @@ if "current_draft" in st.session_state:
         except VisitNotUpdated as e:
             # Zapis nie doszedł do skutku — lepiej powiedzieć to wprost, niż pokazać
             # „zatwierdzono" i pozwolić zamknąć kartę z niezapisaną dokumentacją.
-            st.error(f"Dokumentacja NIE została zapisana. {e}")
+            st.error(f"Notatka NIE została zapisana. {e}")
             st.stop()
 
         st.session_state["approved_doc"] = approved.model_dump(mode="json")
@@ -238,7 +256,7 @@ if "current_draft" in st.session_state:
         st.session_state["approved_visit_created_at"] = (_record or {}).get("created_at")
         st.session_state["approved_visit_type"] = st.session_state.get("current_visit_type")
         st.success(
-            f"Wizyta #{visit_id} zatwierdzona. Ta dokumentacja posłuży jako wzorzec stylu "
+            f"Wizyta #{visit_id} zatwierdzona. Ta notatka posłuży jako wzorzec stylu "
             "przy kolejnych wizytach."
         )
         for key in ("current_draft", "current_document", "current_visit_id", "debug_prompt"):
@@ -248,9 +266,9 @@ if "current_draft" in st.session_state:
         with st.expander("🐛 Debug: prompt wysłany do Gemini", expanded=False):
             st.code(st.session_state["debug_prompt"], language="markdown")
 
-# --- 5. Zatwierdzona dokumentacja do skopiowania -------------------------------
+# --- 5. Zatwierdzona notatka do skopiowania ------------------------------------
 if "approved_doc" in st.session_state:
-    st.header("5. Gotowa dokumentacja")
+    st.header("5. Gotowa notatka")
     approved = st.session_state["approved_doc"]
     a_type = st.session_state.get("approved_visit_type")
     visit_caption(a_type)
@@ -267,3 +285,14 @@ if "approved_doc" in st.session_state:
     with st.expander("📄 Pełny tekst (zaznacz i skopiuj ręcznie)", expanded=False):
         st.text(full_text)
     copy_button(full_text, key="copy_new")
+
+# --- Nowa wizyta ----------------------------------------------------------------
+# Na samym dole, gdzie lekarz kończy pracę z wizytą. Niezatwierdzony szkic nie ginie:
+# jest zapisany w bazie i czeka w Historii wizyt.
+if any(key in st.session_state for key in ("current_draft", "approved_doc")):
+    st.divider()
+    if st.button("🆕 Nowa wizyta", type="primary", use_container_width=True):
+        for key in _VISIT_STATE:
+            st.session_state.pop(key, None)
+        st.session_state["visit_form_nonce"] = _form + 1
+        st.rerun()

@@ -1,13 +1,14 @@
 """Polecenia dla modelu.
 
-Treść kliniczna — rola, zasady, struktura sekcji A–Q, sposób redagowania — żyje w
+Treść kliniczna — rola, zasady, zakres informacji A–Q, forma notatki — żyje w
 `prompts/dokumentacja.md`, a nie tutaj. To celowe: to tekst lekarza, nie programisty,
 i ma dać się poprawić bez dotykania kodu. Ten moduł dokleja do niego wyłącznie reguły
-techniczne: jak sekcje mapują się na pola odpowiedzi, co zrobić z niemym nagraniem
+techniczne: jak notatka i pola pomocnicze mapują się na odpowiedź, co zrobić z niemym nagraniem
 i jak traktować przykłady stylu.
 """
 
 import json
+import re
 from pathlib import Path
 
 _PROMPT_FILE = Path(__file__).resolve().parent.parent / "prompts" / "dokumentacja.md"
@@ -25,25 +26,21 @@ def _load_clinical_prompt() -> str:
 TECHNICAL_RULES = """\
 8. Zasady techniczne aplikacji
 
-Odpowiadasz wyłącznie w formacie JSON zgodnym ze schematem. Pola `a_dane_ogolne` … \
-`q_podsumowanie_plan` odpowiadają sekcjom A–Q z punktu 3.
+Odpowiadasz wyłącznie w formacie JSON zgodnym ze schematem.
 
-- Sekcję, której obszaru nie poruszono podczas konsultacji, zostaw PUSTĄ. Aplikacja sama \
-oznaczy ją jako nieporuszoną. Nie wpisuj tam ogólników, zastrzeżeń ani zdań w rodzaju \
-„brak danych".
-- Sekcję omówioną częściowo wypełnij tym, co padło, a brakujące elementy oznacz wewnątrz \
-niej zgodnie z punktem 5.
-- `e_leki`: osobny wpis dla każdego leku, o którym rozmawiano. W `opis` uwzględnij punkty \
-1–16 sekcji E w zakresie, w jakim padły w rozmowie.
-- `j_bezpieczenstwo.status`: OBECNE, ZAPRZECZA albo NIE_OCENIANO. Wybierz ZAPRZECZA wyłącznie \
-wtedy, gdy temat został poruszony i pacjent zaprzeczył. Jeśli nie pytano — NIE_OCENIANO.
-- `j_bezpieczenstwo.pilne`: true, gdy nagranie wskazuje na aktualne zagrożenie życia lub zdrowia.
+- `notatka`: cała notatka z wizyty jako jeden tekst, w formie z punktu 4 — akapity \
+oddzielone pustą linią, bez nagłówków, liter A–Q, wypunktowań i znaczników formatowania. \
+Tę treść lekarz wkleja wprost do dokumentacji medycznej.
+- `bezpieczenstwo.status`: OBECNE, ZAPRZECZA albo NIE_OCENIANO. Wybierz ZAPRZECZA wyłącznie \
+wtedy, gdy temat został poruszony i pacjent zaprzeczył. Jeśli nie pytano — NIE_OCENIANO, \
+a w notatce o tym obszarze nie piszesz nic.
+- `bezpieczenstwo.pilne`: true, gdy nagranie wskazuje na aktualne zagrożenie życia lub zdrowia.
 - `do_weryfikacji`: konkretne kwestie do sprawdzenia przez lekarza przed zatwierdzeniem — \
 niejasne lub sprzeczne informacje, nieustalone dawki, niepewne nazwy leków, nieczytelne \
-fragmenty. Każda jednym zdaniem, ze wskazaniem sekcji.
+fragmenty. Każda jednym zdaniem. Nie powtarzaj ich w notatce jako osobnej listy.
 - Nagranie bez zrozumiałej mowy (cisza, szum, uszkodzenie): `jakosc_nagrania` = BRAK_MOWY, \
-wszystkie sekcje puste, `j_bezpieczenstwo.status` = NIE_OCENIANO. Nie twórz żadnej treści — \
-pusta dokumentacja jest tu jedyną poprawną odpowiedzią.
+`notatka` pusta, `bezpieczenstwo.status` = NIE_OCENIANO. Nie twórz żadnej treści — \
+pusta notatka jest tu jedyną poprawną odpowiedzią.
 - PRZYKŁADY zatwierdzonej dokumentacji, jeśli są dołączone, pokazują wyłącznie sposób \
 pisania tej osoby. Nigdy nie przenoś z nich treści, objawów, leków ani dawek.
 """
@@ -60,6 +57,19 @@ def _document_of(note_json: str) -> str:
     return str(data.get("dokument") or "").strip() if isinstance(data, dict) else ""
 
 
+# Nagłówek sekcji ze starego formatu: „A. Dane ogólne…", „J. Myśli samobójcze…".
+_SECTION_HEADER = re.compile(r"^[A-Q]\. \S", re.MULTILINE)
+
+
+def _is_sectioned(document: str) -> bool:
+    """Dokumentacja zatwierdzona jeszcze w formacie sekcji A–Q.
+
+    Taki przykład jako wzorzec stylu ciągnąłby model z powrotem do sekcji — a styl
+    z przykładów model przejmuje silniej niż opis formy w poleceniu.
+    """
+    return len(_SECTION_HEADER.findall(document)) >= 3
+
+
 def build_few_shot_block(examples: list[dict]) -> str:
     """Zatwierdzona dokumentacja tej osoby jako wzorzec stylu.
 
@@ -67,7 +77,11 @@ def build_few_shot_block(examples: list[dict]) -> str:
     w zapisie rozmowy. Transkrypcja w promptcie to tokeny i czas generowania za darmo
     oraz kanał, którym treść jednej wizyty mogłaby trafić do drugiej.
     """
-    documents = [doc for ex in examples if (doc := _document_of(ex.get("note_json", "")))]
+    documents = [
+        doc
+        for ex in examples
+        if (doc := _document_of(ex.get("note_json", ""))) and not _is_sectioned(doc)
+    ]
     if not documents:
         return ""
 
@@ -126,14 +140,14 @@ def build_user_prompt(
 
     if transcript:
         parts.append(f"### TRANSKRYPCJA KONSULTACJI\n{transcript}\n")
-        parts.append("Przygotuj dokumentację zgodnie z poleceniem i schematem.")
+        parts.append("Napisz notatkę z wizyty zgodnie z poleceniem i schematem.")
     elif with_transcript:
         parts.append(
             "### NAGRANIE KONSULTACJI\n"
             "W załączeniu nagranie audio konsultacji.\n"
             "1. Najpierw oceń, czy nagranie zawiera zrozumiałą mowę.\n"
             "2. Jeśli TAK — przepisz dosłowną transkrypcję do `raw_transcript`, a następnie "
-            "przygotuj dokumentację na jej podstawie.\n"
+            "napisz notatkę z wizyty na jej podstawie.\n"
             "3. Jeśli NIE — `raw_transcript` zostaw puste i postąp zgodnie z zasadą "
             "o nagraniu bez zrozumiałej mowy."
         )
@@ -143,7 +157,7 @@ def build_user_prompt(
             "W załączeniu nagranie audio konsultacji. Transkrypcję przygotowuje osobny "
             "proces — Ty jej nie przepisujesz.\n"
             "1. Najpierw oceń, czy nagranie zawiera zrozumiałą mowę.\n"
-            "2. Jeśli TAK — wysłuchaj całego nagrania uważnie i przygotuj dokumentację "
+            "2. Jeśli TAK — wysłuchaj całego nagrania uważnie i napisz notatkę z wizyty "
             "bezpośrednio na jego podstawie.\n"
             "3. Jeśli NIE — postąp zgodnie z zasadą o nagraniu bez zrozumiałej mowy."
         )

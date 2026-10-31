@@ -22,11 +22,11 @@ from typing import Any, Mapping
 from . import config
 from .audio import save_uploaded_audio
 from .db import get_approved_examples, get_visit, insert_visit, update_visit
-from .formatting import draft_to_document, risk_status
+from .formatting import draft_to_document, is_note_draft, risk_status
 from .pricing import merge_usage
 from .schemas import (
     DokumentacjaDraft,
-    DokumentacjaSekcje,
+    NotatkaWizyty,
     JakoscNagrania,
     Ryzyko,
     ZatwierdzonaDokumentacja,
@@ -242,7 +242,7 @@ def _generate_in_parallel(
     return draft, prompt, merge_usage(doc_usage, transcript_usage), model_s, transcription_s
 
 
-def _with_review_item(sekcje: DokumentacjaSekcje, note: str) -> DokumentacjaSekcje:
+def _with_review_item(sekcje: NotatkaWizyty, note: str) -> NotatkaWizyty:
     return sekcje.model_copy(update={"do_weryfikacji": [*sekcje.do_weryfikacji, note]})
 
 
@@ -336,9 +336,9 @@ def resolve_note_version(visit: Mapping[str, Any]) -> ResolvedNote:
             draft=draft,
         )
 
-    # Szkic rozpoznajemy po obecności sekcji J — tylko schemat tej wersji ją ma.
+    # Szkic rozpoznajemy po polu notatki albo — w starszych zapisach — po sekcji J.
     # Zapis w innym formacie pokazujemy surowo, zamiast składać z niego pusty dokument.
-    if draft and "j_bezpieczenstwo" in draft:
+    if is_note_draft(draft):
         return ResolvedNote(
             document=draft_to_document(draft),
             ryzyko=risk_status(draft),

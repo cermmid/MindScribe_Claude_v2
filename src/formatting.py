@@ -1,12 +1,11 @@
 """Składanie dokumentacji do postaci tekstu i pomocnicze nazwy wizyt.
 
-Lekarz poprawia całą dokumentację jako JEDEN tekst. Ten moduł zamienia ustrukturyzowaną
-odpowiedź modelu (`DokumentacjaDraft`) w ten tekst: sekcje A–Q w stałej kolejności,
-każda z nagłówkiem, puste oznaczone jako nieporuszone.
+Lekarz poprawia całą dokumentację jako JEDEN tekst — notatkę z wizyty, pisaną ciągłym
+tekstem tak, jak pisze ją lekarz. Ten moduł zamienia odpowiedź modelu (`DokumentacjaDraft`)
+w ten tekst.
 
-Pusta sekcja dostaje znacznik od APLIKACJI, nie od modelu. Model ma zostawiać nieporuszone
-obszary puste — dzięki temu nie ma pokusy dopisania ogólników w rodzaju „pacjent nie
-zgłasza…", których prompt kliniczny wprost zabrania („Brak danych nie oznacza zaprzeczenia").
+Szkice zapisane wcześniej, w formacie sekcji A–Q (każdy obszar w osobnym polu), składamy
+po staremu — z nagłówkami i znacznikiem „nie poruszono" — żeby historia dalej je pokazywała.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -80,14 +79,24 @@ def audio_quality_label(note: dict[str, Any]) -> str | None:
     return None
 
 
+def _safety(draft: dict[str, Any]) -> dict[str, Any]:
+    """Pole bezpieczeństwa — `bezpieczenstwo` w notatce, `j_bezpieczenstwo` w starych szkicach."""
+    return draft.get("bezpieczenstwo") or draft.get("j_bezpieczenstwo") or {}
+
+
 def risk_status(draft: dict[str, Any]) -> str:
-    """Status z sekcji J; brak danych traktujemy jako NIE_OCENIANO, nigdy jako zaprzeczenie."""
-    status = enum_value((draft.get("j_bezpieczenstwo") or {}).get("status")).upper()
+    """Status ryzyka; brak danych traktujemy jako NIE_OCENIANO, nigdy jako zaprzeczenie."""
+    status = enum_value(_safety(draft).get("status")).upper()
     return status if status in RYZYKO_OPIS else "NIE_OCENIANO"
 
 
 def risk_is_urgent(draft: dict[str, Any]) -> bool:
-    return bool((draft.get("j_bezpieczenstwo") or {}).get("pilne"))
+    return bool(_safety(draft).get("pilne"))
+
+
+def is_note_draft(draft: dict[str, Any] | None) -> bool:
+    """Czy to szkic, który umiemy złożyć w dokument — notatka albo stary format A–Q."""
+    return bool(draft) and ("notatka" in draft or "j_bezpieczenstwo" in draft)
 
 
 def _section_body(field: str, draft: dict[str, Any]) -> str:
@@ -119,19 +128,25 @@ def _section_body(field: str, draft: dict[str, Any]) -> str:
 
 
 def draft_to_document(draft: dict[str, Any]) -> str:
-    """Ustrukturyzowana odpowiedź modelu → jeden tekst do edycji przez lekarza.
-
-    Zawiera wszystkie sekcje, także nieporuszone. To celowe: lekarz od razu widzi,
-    które obszary wizyta pominęła — to jest kontrola kompletności z punktu 6 promptu,
-    tylko wykonana na oczach lekarza, a nie wyłącznie przez model.
+    """Odpowiedź modelu → jeden tekst do edycji przez lekarza.
 
     Lista `do_weryfikacji` NIE trafia do dokumentu. To lista zadań dla lekarza przed
     zatwierdzeniem, a nie treść dokumentacji medycznej.
 
-    Ostrzeżenie o nagraniu natomiast trafia — i to na sam początek. Przy niemym nagraniu
-    każda sekcja mówi „nie poruszono", a wklejone bez ostrzeżenia czyta się jak wizyta,
-    na której nic nie omówiono. Prawda jest inna: nagranie zawiodło.
+    Ostrzeżenie o słabym nagraniu natomiast trafia — i to na sam początek. Notatka
+    z częściowo niezrozumiałego nagrania czyta się jak pełna, a jest dziurawa; lekarz
+    musi to zobaczyć, zanim ją wklei.
     """
+    if "notatka" not in draft:
+        return _legacy_document(draft)
+    blocks = [str(draft.get("notatka") or "").strip()]
+    if warning := audio_quality_label(draft):
+        blocks.insert(0, f"!! UWAGA: {warning}")
+    return "\n\n".join(b for b in blocks if b).strip() + "\n"
+
+
+def _legacy_document(draft: dict[str, Any]) -> str:
+    """Szkic w starym formacie sekcji A–Q — z nagłówkami i oznaczeniem nieporuszonych."""
     blocks = [f"{title}\n{_section_body(field, draft)}" for field, title in SEKCJE]
     if warning := audio_quality_label(draft):
         blocks.insert(0, f"!! UWAGA: {warning}")

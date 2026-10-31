@@ -108,8 +108,9 @@ except DatabaseUnavailable as exc:
 
 st.navigation(
     [
-        st.Page("views/home.py", title="Strona główna", icon="🏠", default=True),
-        st.Page("views/new_visit.py", title="Nowa wizyta", icon="🎙️"),
+        # „Wizyta" jest pierwsza i otwiera się od razu: po to lekarz wchodzi do aplikacji.
+        st.Page("views/new_visit.py", title="Wizyta", icon="🎙️", default=True),
         st.Page("views/history.py", title="Historia wizyt", icon="📚"),
+        st.Page("views/home.py", title="O aplikacji", icon="ℹ️"),
     ]
 ).run()

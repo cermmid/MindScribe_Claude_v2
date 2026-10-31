@@ -18,7 +18,7 @@ from src import config, gemini_client, services
 from src.auth import email_allowed, parse_allowed_emails
 from src.pricing import merge_usage
 from src.prompts import NO_SPEECH_MARKER, build_user_prompt
-from src.schemas import DokumentacjaDraft, DokumentacjaSekcje
+from src.schemas import DokumentacjaDraft, NotatkaWizyty
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -30,31 +30,30 @@ class TestSchemaVariants:
     def test_draft_order_quality_then_transcript_then_sections(self):
         """Gemini pisze pola w kolejności schematu: transkrypcja przed sekcjami."""
         fields = list(DokumentacjaDraft.model_fields)
-        assert fields[:3] == ["jakosc_nagrania", "raw_transcript", "a_dane_ogolne"]
+        assert fields[:3] == ["jakosc_nagrania", "raw_transcript", "notatka"]
         assert fields[-1] == "do_weryfikacji"
 
     def test_sections_variant_has_no_transcript(self):
         """Bez tego pola model dokumentacji nie przepisuje rozmowy — to jest cały zysk czasu."""
-        fields = list(DokumentacjaSekcje.model_fields)
+        fields = list(NotatkaWizyty.model_fields)
         assert "raw_transcript" not in fields
         assert fields[0] == "jakosc_nagrania"
         assert fields[-1] == "do_weryfikacji"
         assert set(DokumentacjaDraft.model_fields) - set(fields) == {"raw_transcript"}
 
     def test_from_parts_keeps_every_section(self):
-        sekcje = DokumentacjaSekcje(
+        sekcje = NotatkaWizyty(
             jakosc_nagrania="DOBRA",
-            c_aktualne_objawy="Obniżony nastrój od 3 miesięcy.",
-            e_leki=[{"nazwa": "sertralina", "opis": "50 mg rano"}],
-            j_bezpieczenstwo={"status": "ZAPRZECZA", "opis": "Zaprzecza myślom S."},
-            do_weryfikacji=["E: dawka niepewna"],
+            notatka="Pacjent zgłasza obniżony nastrój od 3 miesięcy. Przyjmuje sertralinę 50 mg rano.",
+            bezpieczenstwo={"status": "ZAPRZECZA"},
+            do_weryfikacji=["Dawka sertraliny niepewna."],
         )
         draft = DokumentacjaDraft.from_parts(sekcje, "  Lekarz: Dzień dobry.\n")
         assert draft.raw_transcript == "Lekarz: Dzień dobry."
         assert draft.model_dump(exclude={"raw_transcript"}) == sekcje.model_dump()
 
     def test_from_parts_accepts_missing_transcript(self):
-        sekcje = DokumentacjaSekcje(jakosc_nagrania="DOBRA", j_bezpieczenstwo={"status": "NIE_OCENIANO"})
+        sekcje = NotatkaWizyty(jakosc_nagrania="DOBRA", bezpieczenstwo={"status": "NIE_OCENIANO"})
         assert DokumentacjaDraft.from_parts(sekcje, None).raw_transcript == ""
 
 
@@ -140,14 +139,14 @@ class TestMergeUsage:
 # --- Równoległe wywołania w serwisie -----------------------------------------------
 
 
-def _sekcje(**overrides) -> DokumentacjaSekcje:
+def _sekcje(**overrides) -> NotatkaWizyty:
     data = {
         "jakosc_nagrania": "DOBRA",
-        "b_powod_zgloszenia": "Kontrola leczenia.",
-        "j_bezpieczenstwo": {"status": "NIE_OCENIANO"},
+        "notatka": "Kontrola leczenia.",
+        "bezpieczenstwo": {"status": "NIE_OCENIANO"},
     }
     data.update(overrides)
-    return DokumentacjaSekcje(**data)
+    return NotatkaWizyty(**data)
 
 
 @pytest.fixture
@@ -191,7 +190,7 @@ class TestParallelGeneration:
         created = _create()
         assert calls == {"documentation": [False], "transcribe": 1}
         assert created.draft.raw_transcript == "Lekarz: Jak się Pan czuje?"
-        assert created.draft.b_powod_zgloszenia == "Kontrola leczenia."
+        assert created.draft.notatka == "Kontrola leczenia."
         assert created.usage["estimated_cost_usd"] == pytest.approx(0.23)
         assert created.timings.transkrypcja is not None
         assert "równolegle" in created.timings.summary()
@@ -206,7 +205,7 @@ class TestParallelGeneration:
         state["fail"] = "transcribe"
         created = _create()
         assert created.draft.raw_transcript == ""
-        assert created.draft.b_powod_zgloszenia == "Kontrola leczenia."
+        assert created.draft.notatka == "Kontrola leczenia."
         assert services.TRANSCRIPTION_FAILED_NOTE in created.draft.do_weryfikacji
         assert created.usage["estimated_cost_usd"] == pytest.approx(0.20)
 
@@ -219,13 +218,13 @@ class TestParallelGeneration:
     def test_speech_mismatch_is_flagged(self, fake_models):
         """Dwa modele, dwie oceny nagrania — sprzeczność ma trafić do lekarza, nie zniknąć."""
         _, state = fake_models
-        state["sekcje"] = _sekcje(jakosc_nagrania="BRAK_MOWY", b_powod_zgloszenia="")
+        state["sekcje"] = _sekcje(jakosc_nagrania="BRAK_MOWY", notatka="")
         created = _create()
         assert services.SPEECH_MISMATCH_NOTE in created.draft.do_weryfikacji
 
     def test_silent_recording_without_transcript_is_not_flagged(self, fake_models):
         _, state = fake_models
-        state["sekcje"] = _sekcje(jakosc_nagrania="BRAK_MOWY", b_powod_zgloszenia="")
+        state["sekcje"] = _sekcje(jakosc_nagrania="BRAK_MOWY", notatka="")
         state["transcript"] = ""
         assert _create().draft.do_weryfikacji == []
 

@@ -7,8 +7,8 @@ st.markdown(
     """
 Nagraj konsultację i odzyskaj czas, który zwykle pochłania jej dokumentowanie.
 
-MindScribe słucha nagrania i przygotowuje szczegółowy, uporządkowany zapis wizyty:
-powód zgłoszenia, aktualne objawy, historię leczenia, osobny opis każdego leku,
+MindScribe słucha nagrania i pisze notatkę z wizyty — ciągłym tekstem, tak jak
+napisałbyś ją sam: powód zgłoszenia, aktualne objawy, historia leczenia i leki,
 omówione leczenie i zalecenia. Ty czytasz, poprawiasz i zatwierdzasz — ostatnie
 słowo zawsze należy do Ciebie.
 
@@ -16,8 +16,8 @@ słowo zawsze należy do Ciebie.
 
 - **Szczegółowo, nie lakonicznie.** Odtwarza przebieg wywiadu zamiast skracać go
   do streszczenia — nie gubi informacji istotnych klinicznie.
-- **Wiernie nagraniu.** Zapisuje tylko to, co padło. Czego nie poruszono, oznacza jako
-  nieporuszone — brak rozmowy o objawie nie staje się jego zaprzeczeniem.
+- **Wiernie nagraniu.** Zapisuje tylko to, co padło. O czym nie rozmawiano, tego
+  w notatce nie ma — brak rozmowy o objawie nie staje się jego zaprzeczeniem.
 - **Nie stawia rozpoznań i nie planuje leczenia.** Dokumentuje rozpoznania i zalecenia
   wyłącznie wtedy, gdy wypowiedział je lekarz.
 - **Pokazuje, co sprawdzić.** Niejasne dawki, sprzeczne informacje i niepewne nazwy
@@ -27,7 +27,7 @@ słowo zawsze należy do Ciebie.
 - **Uczy się Twojego stylu.** Im więcej dokumentacji zatwierdzisz, tym bardziej kolejne
   przypominają sposób, w jaki piszesz Ty.
 
-Zacznij od **Nowa wizyta** w panelu po lewej.
+Zacznij od **Wizyta** w panelu po lewej.
     """
 )
 

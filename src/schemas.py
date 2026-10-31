@@ -2,14 +2,15 @@
 
 Dwa modele, celowo rozdzielone:
 
-- `DokumentacjaDraft` to `response_schema` dla Gemini. Sekcje A–Q odpowiadają punktowi 3
-  promptu klinicznego (`prompts/dokumentacja.md`). Opisy pól są częścią polecenia dla
-  modelu, nie dokumentacją kodu — model czyta je przy generowaniu.
+- `DokumentacjaDraft` to `response_schema` dla Gemini: jedna notatka z wizyty, pisana
+  ciągłym tekstem jak przez lekarza, plus pola, których aplikacja potrzebuje w postaci
+  maszynowej (jakość nagrania, status ryzyka, lista do sprawdzenia). Opisy pól są częścią
+  polecenia dla modelu, nie dokumentacją kodu — model czyta je przy generowaniu.
 - `ZatwierdzonaDokumentacja` to to, co lekarz zatwierdził: jeden tekst, który sam
   poprawił, plus potwierdzony przez niego status ryzyka samobójczego.
 
 **Kolejność pól ma znaczenie.** Gemini generuje pola w kolejności schematu. Transkrypcja
-jest pierwsza, więc model pisze sekcje, mając ją już przed sobą. `do_weryfikacji` jest
+jest pierwsza, więc model pisze notatkę, mając ją już przed sobą. `do_weryfikacji` jest
 ostatnia, więc powstaje po napisaniu całości — to jest kontrola kompletności z punktu 6.
 """
 
@@ -39,23 +40,6 @@ class Ryzyko(str, Enum):
     NIE_OCENIANO = "NIE_OCENIANO"
 
 
-class Lek(BaseModel):
-    nazwa: str = Field(
-        description=(
-            "Nazwa leku w takim brzmieniu, w jakim padła. Gdy pacjent nie jest pewien nazwy, "
-            "dopisz to wprost, na przykład: sertralina (nazwa niepewna)."
-        )
-    )
-    opis: str = Field(
-        description=(
-            "Szczegółowy opis tego leku według punktów 1–16 sekcji E, w zakresie, w jakim "
-            "padły w rozmowie: dawki i ich zmiany, okres przyjmowania, powód, efekt, "
-            "działania niepożądane, przyczyna i sposób odstawienia, przerwy, powrót. "
-            "Pomiń punkty, o których nie rozmawiano — nie wypełniaj ich ogólnikami."
-        )
-    )
-
-
 class Bezpieczenstwo(BaseModel):
     status: Ryzyko = Field(
         description=(
@@ -64,13 +48,6 @@ class Bezpieczenstwo(BaseModel):
             "zaprzecza. NIE_OCENIANO — temat nie został poruszony albo nagranie nie pozwala "
             "go ocenić. Nigdy nie wybieraj ZAPRZECZA, jeśli o to nie pytano."
         )
-    )
-    opis: str = Field(
-        default="",
-        description=(
-            "Treść sekcji J: precyzyjnie, bez eufemizmów i bez bagatelizowania. Pusta, gdy "
-            "temat nie został poruszony."
-        ),
     )
     pilne: bool = Field(
         default=False,
@@ -81,9 +58,9 @@ class Bezpieczenstwo(BaseModel):
     )
 
 
-# Jedno źródło prawdy o sekcjach: pole schematu → nagłówek w dokumencie. Używają go
-# zarówno opisy pól poniżej, jak i składanie tekstu do edycji (`src/formatting.py`).
-# Sekcje E (leki) i J (bezpieczeństwo) mają własną strukturę i są obsługiwane osobno.
+# Sekcje A–Q z wcześniejszego formatu odpowiedzi (każdy obszar w osobnym polu).
+# Model już ich nie dostaje — notatka jest jednym tekstem. Lista zostaje wyłącznie po to,
+# żeby szkice zapisane w starym formacie dało się dalej wyświetlić w historii.
 SEKCJE: list[tuple[str, str]] = [
     ("a_dane_ogolne", "A. Dane ogólne i sytuacja życiowa pacjenta"),
     ("b_powod_zgloszenia", "B. Główny powód zgłoszenia się na wizytę"),
@@ -108,17 +85,10 @@ SEKCJE: list[tuple[str, str]] = [
 ]
 
 
-def _sekcja(litera: str) -> str:
-    return (
-        f"Treść sekcji {litera} z punktu 3 polecenia. Zostaw PUSTE, jeśli tego obszaru nie "
-        "poruszono — aplikacja sama oznaczy go jako nieporuszony. Nie wpisuj ogólników."
-    )
-
-
 # Schemat składamy z trzech części, żeby z tych samych pól powstały dwa warianty
 # odpowiedzi. Pydantic układa pola klas bazowych od OSTATNIEJ na liście dziedziczenia,
 # więc `class X(_Tresc, _Transkrypcja, _Jakosc)` daje kolejność: jakość, transkrypcja,
-# sekcje. Kolejność pilnują testy — Gemini generuje pola dokładnie w tej kolejności.
+# notatka. Kolejność pilnują testy — Gemini generuje pola dokładnie w tej kolejności.
 
 
 class _Jakosc(BaseModel):
@@ -143,44 +113,36 @@ class _Transkrypcja(BaseModel):
 
 
 class _Tresc(BaseModel):
-    a_dane_ogolne: str = Field(default="", description=_sekcja("A"))
-    b_powod_zgloszenia: str = Field(default="", description=_sekcja("B"))
-    c_aktualne_objawy: str = Field(default="", description=_sekcja("C"))
-    d_historia_leczenia: str = Field(default="", description=_sekcja("D"))
-    e_leki: list[Lek] = Field(
-        default_factory=list,
+    notatka: str = Field(
+        default="",
         description=(
-            "Sekcja E: osobny wpis dla KAŻDEGO leku, o którym rozmawiano — obecnego "
-            "i wcześniejszego. Pusta lista, gdy o lekach nie rozmawiano."
+            "Notatka z wizyty napisana tak, jak napisałby ją lekarz po przeprowadzonej "
+            "konsultacji: ciągły tekst w akapitach, BEZ nagłówków, liter sekcji, wypunktowań "
+            "i oznaczeń „nie poruszono”. Obszary z punktu 3 polecenia to lista kontrolna "
+            "tego, co uwzględnić, a nie struktura tekstu. Obszarów, których nie poruszono, "
+            "nie wymieniaj. Leki opisuj zdaniami, z dawkami, okresem przyjmowania, efektem "
+            "i działaniami niepożądanymi, jeśli padły. Pusta, gdy w nagraniu nie ma mowy."
         ),
     )
-    f_rozwoj_funkcjonowanie: str = Field(default="", description=_sekcja("F"))
-    g_kontekst_zyciowy: str = Field(default="", description=_sekcja("G"))
-    h_obciazenie_praca: str = Field(default="", description=_sekcja("H"))
-    i_objawy_depresyjne: str = Field(default="", description=_sekcja("I"))
-    j_bezpieczenstwo: Bezpieczenstwo = Field(
-        description="Sekcja J — myśli samobójcze i inne kwestie bezpieczeństwa."
+    bezpieczenstwo: Bezpieczenstwo = Field(
+        description=(
+            "Status myśli i zachowań samobójczych na potrzeby aplikacji — niezależnie od tego, "
+            "co o tym napisano w notatce."
+        )
     )
-    k_objawy_psychotyczne: str = Field(default="", description=_sekcja("K"))
-    l_inne_medyczne: str = Field(default="", description=_sekcja("L"))
-    m_stan_psychiczny: str = Field(default="", description=_sekcja("M"))
-    n_omowienie_leczenia: str = Field(default="", description=_sekcja("N"))
-    o_psychoterapia_zalecenia: str = Field(default="", description=_sekcja("O"))
-    p_zwolnienie: str = Field(default="", description=_sekcja("P"))
-    q_podsumowanie_plan: str = Field(default="", description=_sekcja("Q"))
     do_weryfikacji: list[str] = Field(
         default_factory=list,
         description=(
             "Konkretne punkty do sprawdzenia przez lekarza PRZED zatwierdzeniem: niejasne "
             "lub sprzeczne informacje, nieustalone dawki, niepewne nazwy leków, nieczytelne "
-            "fragmenty nagrania. Każdy punkt jednym zdaniem, ze wskazaniem sekcji. "
-            "Pusta lista, gdy nie ma czego sprawdzać."
+            "fragmenty nagrania. Każdy punkt jednym zdaniem. Pusta lista, gdy nie ma czego "
+            "sprawdzać."
         ),
     )
 
 
-class DokumentacjaSekcje(_Tresc, _Jakosc):
-    """Odpowiedź modelu dokumentacji, gdy transkrypcję robi osobny, szybszy model.
+class NotatkaWizyty(_Tresc, _Jakosc):
+    """Odpowiedź modelu dokumentacji, gdy transkrypcję robi osobny model.
 
     Bez pola transkrypcji: to ona była największą częścią tekstu, który model pisał
     token po tokenie. Model nadal SŁYSZY całe nagranie — nie musi go tylko przepisywać.
@@ -191,13 +153,13 @@ class DokumentacjaDraft(_Tresc, _Transkrypcja, _Jakosc):
     """Pełny szkic do weryfikacji, nigdy dokument ostateczny.
 
     W trybie jednego wywołania to jest odpowiedź modelu. W trybie osobnej transkrypcji
-    aplikacja składa go z `DokumentacjaSekcje` i tekstu od modelu transkrypcji —
+    aplikacja składa go z `NotatkaWizyty` i tekstu od modelu transkrypcji —
     reszta aplikacji (zapis, widoki, historia) widzi zawsze ten sam kształt.
     """
 
     @classmethod
-    def from_parts(cls, sekcje: "DokumentacjaSekcje", transkrypcja: str) -> "DokumentacjaDraft":
-        return cls(**sekcje.model_dump(), raw_transcript=(transkrypcja or "").strip())
+    def from_parts(cls, notatka: "NotatkaWizyty", transkrypcja: str) -> "DokumentacjaDraft":
+        return cls(**notatka.model_dump(), raw_transcript=(transkrypcja or "").strip())
 
 
 class ZatwierdzonaDokumentacja(BaseModel):

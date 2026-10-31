@@ -7,9 +7,9 @@
 > ⚠️ **Ta wersja musi mieć własną bazę i własne logowanie.** To nie jest zalecenie porządkowe,
 > tylko warunek bezpieczeństwa danych — szczegóły w sekcji *Rozdzielenie od pierwszej wersji*.
 
-Aplikacja webowa wspierająca **lekarza w dokumentowaniu konsultacji**, w szczególności psychiatrycznych: nagranie wizyty → transkrypcja i szczegółowa, uporządkowana dokumentacja w sekcjach A–Q → weryfikacja i poprawki lekarza w jednym dokumencie → zatwierdzenie i zapis w bazie.
+Aplikacja webowa wspierająca **lekarza w dokumentowaniu konsultacji**, w szczególności psychiatrycznych: nagranie wizyty → transkrypcja i szczegółowa notatka z wizyty, pisana ciągłym tekstem tak, jak pisze ją lekarz → weryfikacja i poprawki lekarza → zatwierdzenie i zapis w bazie.
 
-Aplikacja **dokumentuje, nie decyduje**: nie stawia rozpoznań, nie tworzy planów leczenia i nie przesądza o zdolności do pracy. Zapisuje to, co padło podczas konsultacji, a czego nie poruszono — oznacza jako nieporuszone.
+Aplikacja **dokumentuje, nie decyduje**: nie stawia rozpoznań, nie tworzy planów leczenia i nie przesądza o zdolności do pracy. Zapisuje to, co padło podczas konsultacji; o czym nie rozmawiano, tego w notatce nie ma.
 
 Zatwierdzona dokumentacja jest doklejana do kolejnych promptów jako **wzorzec stylu** (3 ostatnie), więc model uczy się sposobu pisania konkretnej osoby. Każdy widzi wyłącznie swoje wizyty.
 
@@ -35,7 +35,7 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 streamlit run app.py
 ```
 
-Aplikacja otworzy się w przeglądarce. Po zalogowaniu w panelu po lewej trzy pozycje: **Strona główna**, **Nowa wizyta** i **Historia wizyt**.
+Aplikacja otworzy się w przeglądarce. Po zalogowaniu otwiera się od razu **Wizyta**; w panelu po lewej są jeszcze **Historia wizyt** i **O aplikacji**. Po przygotowaniu notatki przycisk **Nowa wizyta** na dole strony czyści formularz pod kolejnego pacjenta.
 
 Panel właściciela (koszty, statystyki) to osobna aplikacja: `streamlit run admin/app.py`.
 
@@ -45,14 +45,14 @@ Panel właściciela (koszty, statystyki) to osobna aplikacja: `streamlit run adm
 MindScribe/
 ├── app.py                    # router: logowanie, init bazy, nawigacja
 ├── prompts/
-│   └── dokumentacja.md       # PROMPT KLINICZNY — rola, zasady, sekcje A–Q (edytuj tutaj)
+│   └── dokumentacja.md       # PROMPT KLINICZNY — rola, zasady, zakres A–Q, forma notatki (edytuj tutaj)
 ├── views/
 │   ├── home.py               # strona główna
 │   ├── new_visit.py          # nagranie → dokumentacja → weryfikacja i edycja → zapis
 │   └── history.py            # własne wizyty
 ├── src/
 │   ├── config.py             # .env + stałe
-│   ├── schemas.py            # sekcje A–Q (response_schema dla Gemini) + wersja zatwierdzona
+│   ├── schemas.py            # notatka (response_schema dla Gemini) + wersja zatwierdzona
 │   ├── prompts.py            # prompt kliniczny + reguły techniczne + wzorce stylu
 │   ├── formatting.py         # odpowiedź modelu → jeden dokument tekstowy
 │   ├── db.py                 # SQLAlchemy: visits, filtr właściciela, agregaty panelu
@@ -62,7 +62,7 @@ MindScribe/
 │   ├── pricing.py            # wycena zużycia per model, suma dwóch wywołań
 │   └── gemini_client.py      # generate_documentation() i transcribe() — audio inline
 ├── admin/app.py              # panel właściciela (osobne hasło)
-├── tests/                    # 169 testów; db też na Postgresie przez TEST_DATABASE_URL
+├── tests/                    # 174 testy; db też na Postgresie przez TEST_DATABASE_URL
 └── data/                     # lokalny SQLite i nagrania (gitignored)
 ```
 
@@ -200,29 +200,29 @@ Warto o nich wiedzieć, bo żadna nie rzuca błędu:
 - `REAL` w Postgresie to float4 — koszt trzymamy jako `Numeric(14,6)`.
 - `SUM()` po kolumnie całkowitej zwraca `Decimal`; konwersja jest w jednym miejscu, przy odczycie wiersza.
 
-## Prompt kliniczny i struktura dokumentacji
+## Prompt kliniczny i forma notatki
 
 ### Gdzie poprawiać prompt
 
-Cała treść kliniczna — rola asystenta, zasady nadrzędne, sekcje A–Q, sposób redagowania i postępowanie z niepewnymi danymi — jest w **`prompts/dokumentacja.md`**. To zwykły plik tekstowy: poprawiasz go jak dokument, commitujesz, a aplikacja po przebudowie używa nowej wersji. Kodu nie trzeba ruszać.
+Cała treść kliniczna — rola asystenta, zasady nadrzędne, zakres informacji A–Q, forma notatki i postępowanie z niepewnymi danymi — jest w **`prompts/dokumentacja.md`**. To zwykły plik tekstowy: poprawiasz go jak dokument, commitujesz, a aplikacja po przebudowie używa nowej wersji. Kodu nie trzeba ruszać.
 
-Aplikacja dokleja do niego tylko krótki blok **reguł technicznych** (`src/prompts.py`): jak sekcje przekładają się na pola odpowiedzi, co zrobić z nagraniem bez mowy i jak traktować wzorce stylu. Jeśli w pliku zmienisz nazwę albo kolejność sekcji, trzeba też zmienić listę `SEKCJE` w `src/schemas.py` — inaczej model będzie wypełniał pola pod starymi nagłówkami.
+Obszary A–Q z punktu 3 są **listą kontrolną tego, co ma się znaleźć w notatce**, a nie jej nagłówkami. Formę opisuje punkt 4: ciągły tekst w akapitach, relacja pacjenta w trzeciej osobie, działania lekarza bezosobowo. Aplikacja dokleja do tego tylko krótki blok **reguł technicznych** (`src/prompts.py`): jak notatka i pola pomocnicze przekładają się na odpowiedź, co zrobić z nagraniem bez mowy i jak traktować wzorce stylu.
 
-### Jak powstaje dokumentacja
+### Jak powstaje notatka
 
-1. Dwa modele słuchają nagrania **jednocześnie**. Pierwsze wywołanie zwraca **ustrukturyzowaną dokumentację**: sekcje A–Q, osobny opis każdego leku (sekcja E), status bezpieczeństwa (sekcja J) i listę kwestii do sprawdzenia. Drugie w tym samym czasie pisze **dosłowną transkrypcję** (szczegóły w *Model i koszty*).
-2. Aplikacja składa z tego **jeden dokument tekstowy**, który lekarz poprawia w całości i zatwierdza.
+1. Dwa wywołania słuchają nagrania **jednocześnie**. Pierwsze zwraca **notatkę z wizyty** jako jeden tekst, a obok niej to, czego aplikacja potrzebuje w postaci maszynowej: jakość nagrania, status bezpieczeństwa i listę kwestii do sprawdzenia. Drugie w tym samym czasie pisze **dosłowną transkrypcję** (szczegóły w *Model i koszty*).
+2. Lekarz poprawia notatkę w całości i zatwierdza.
 3. Zatwierdzony tekst trafia do bazy i staje się wzorcem stylu dla kolejnych wizyt tej osoby.
 
 Kilka decyzji, które nie są oczywiste z samego promptu:
 
-- **Sekcja nieporuszona dostaje znacznik od aplikacji, nie od modelu.** Model zostawia ją pustą, aplikacja wpisuje „Nie poruszono podczas konsultacji.". Gdyby to model miał coś wpisać, kusiłoby go dopisanie „pacjent nie zgłasza…" — a brak rozmowy o objawie nie jest jego zaprzeczeniem.
-- **Wszystkie sekcje są w dokumencie, także puste.** Lekarz od razu widzi, czego wizyta nie objęła.
-- **Ryzyko samobójcze ma trzy stany:** zgłaszane / pacjent zaprzecza / **nie oceniano**. Pierwsza wersja aplikacji miała dwa i przy nieporuszonym temacie wpisywała „nieobecne" — w dokumentacji wyglądało to jak zaprzeczenie. Status lekarz potwierdza jawnie przy zatwierdzaniu.
+- **O czym nie rozmawiano, tego w notatce nie ma** — bez „nie poruszono" i bez „pacjent nie zgłasza…". Brak rozmowy o objawie nie jest jego zaprzeczeniem.
+- **Ryzyko samobójcze ma trzy stany:** zgłaszane / pacjent zaprzecza / **nie oceniano**. Status pokazuje się nad notatką, także wtedy, gdy w notatce o nim nic nie ma, i lekarz potwierdza go jawnie przy zatwierdzaniu.
 - **Fragment oznaczony jako pilny** (aktualne zagrożenie życia lub zdrowia) blokuje zatwierdzenie, dopóki lekarz nie potwierdzi, że go zweryfikował.
-- **Lista „do sprawdzenia przed zatwierdzeniem"** stoi nad dokumentem i do niego nie trafia — to zadania dla lekarza, nie treść dokumentacji medycznej.
-- **Transkrypcja nie trafia do dokumentu ani do wzorców stylu.** Jest dostępna obok, do porównania.
-- **Nieme nagranie jest ogłaszane na początku dokumentu.** Inaczej dokument z samymi „nie poruszono" czytałby się jak wizyta, na której nic nie omówiono.
+- **Lista „do sprawdzenia przed zatwierdzeniem"** stoi nad notatką i do niej nie trafia — to zadania dla lekarza, nie treść dokumentacji medycznej.
+- **Transkrypcja nie trafia do notatki ani do wzorców stylu.** Jest dostępna obok, do porównania.
+- **Słabe albo nieme nagranie jest ogłaszane na początku notatki.** Inaczej dziurawa albo pusta notatka czytałaby się jak pełny zapis wizyty.
+- **Stara dokumentacja z nagłówkami A–Q nie trafia do wzorców stylu** — model przejmuje formę z przykładów silniej niż z polecenia i wróciłby do sekcji. Szkice w starym formacie historia dalej pokazuje po staremu.
 
 ### Czego aplikacja nie robi — celowo
 
@@ -249,7 +249,7 @@ Pokrętła zmieniasz w sekretach, bez ruszania kodu (wymagają restartu aplikacj
 
 ### Transkrypcja osobno, równolegle
 
-**Czas zależy głównie od wyjścia, nie od audio** — model pisze tekst token po tokenie. Na wyjście składają się trzy rzeczy: myślenie, szczegółowa dokumentacja A–Q i dosłowna transkrypcja, z nich zwykle najdłuższa. Przy jednym wywołaniu model pisał je jedną po drugiej.
+**Czas zależy głównie od wyjścia, nie od audio** — model pisze tekst token po tokenie. Na wyjście składają się trzy rzeczy: myślenie, szczegółowa notatka i dosłowna transkrypcja, z nich zwykle najdłuższa. Przy jednym wywołaniu model pisał je jedną po drugiej.
 
 Teraz są **dwa wywołania naraz**: jedno słucha nagrania i pisze wyłącznie dokumentację, drugie w tym samym czasie pisze dosłowną transkrypcję jako zwykły tekst. Czas oczekiwania to **dłuższe z dwóch, nie suma**. Dokumentacji nie skracamy, bo prompt kliniczny stawia kompletność ponad zwięzłość. Rzeczywiste czasy obu etapów widać po każdej wizycie i w panelu właściciela.
 

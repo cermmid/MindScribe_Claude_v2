@@ -20,7 +20,7 @@ from .config import (
 )
 from .pricing import estimate_usage_and_cost
 from .prompts import NO_SPEECH_MARKER, SYSTEM_PROMPT, TRANSCRIPTION_PROMPT, build_user_prompt
-from .schemas import DokumentacjaDraft, DokumentacjaSekcje
+from .schemas import DokumentacjaDraft, NotatkaWizyty
 
 
 def _vertex_credentials():
@@ -191,11 +191,11 @@ def generate_documentation(
     """Dokumentacja z nagrania, wysłanego inline.
 
     `with_transcript=True` — model pisze też transkrypcję (odpowiedź `DokumentacjaDraft`).
-    `with_transcript=False` — tylko sekcje (`DokumentacjaSekcje`), bo transkrypcję robi
+    `with_transcript=False` — tylko notatka (`NotatkaWizyty`), bo transkrypcję robi
     równolegle osobny model. Inline działa i na Vertex AI, i na Developer API — Vertex
     nie ma Files API, więc to jedyna ścieżka wspólna dla obu.
     """
-    schema = DokumentacjaDraft if with_transcript else DokumentacjaSekcje
+    schema = DokumentacjaDraft if with_transcript else NotatkaWizyty
     prompt = build_user_prompt(
         few_shot_examples, transcript=None, visit_type=visit_type, with_transcript=with_transcript
     )

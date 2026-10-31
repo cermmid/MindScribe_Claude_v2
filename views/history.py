@@ -23,7 +23,7 @@ except DatabaseUnavailable as exc:
     st.stop()
 if not visits:
     st.info(
-        "Brak zapisanych wizyt. Przejdź do **Nowa wizyta**, żeby przygotować pierwszą "
+        "Brak zapisanych wizyt. Przejdź do **Wizyta**, żeby przygotować pierwszą "
         "dokumentację."
     )
     st.stop()
